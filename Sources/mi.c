@@ -8,6 +8,8 @@
 #pragma comment(lib, "kernel32.lib")
 
 #define MI_READ_TIMEOUT 1000
+#define MI_VIBRATION_RETRY_DELAY 50
+#define MI_VIBRATION_OFF_RETRIES 20
 
 #define MI_VIBRATION_HEADER         0
 #define MI_VIBRATION_SMALL_MOTOR    1
@@ -166,12 +168,10 @@ static DWORD WINAPI _mi_input_thread_proc(LPVOID lparam)
 static DWORD WINAPI _mi_output_thread_proc(LPVOID lparam)
 {
     struct mi_gamepad *gp = (struct mi_gamepad *)lparam;
-    
-    HANDLE dummy_event = CreateEvent(NULL, TRUE, FALSE, NULL);
-    HANDLE wait_events[3] = { gp->stopping_event, gp->out_event, dummy_event };
-    HANDLE timer = CreateWaitableTimer(NULL, TRUE, NULL);
-    LARGE_INTEGER due_time;
-    due_time.QuadPart = -20000000LL; // 2 sec
+
+    HANDLE wait_events[2] = { gp->stopping_event, gp->out_event };
+    DWORD timeout = INFINITE;
+    // last successfully sent vibration state
     BYTE vibration[3];
     vibration[MI_VIBRATION_HEADER] = init_vibration[MI_VIBRATION_HEADER];
     vibration[MI_VIBRATION_SMALL_MOTOR] = gp->small_motor;
@@ -179,49 +179,50 @@ static DWORD WINAPI _mi_output_thread_proc(LPVOID lparam)
 
     while (gp->active)
     {
-        DWORD wait_result = WaitForMultipleObjects(3, wait_events, FALSE, INFINITE);
-        // if timer signaled
-        if (wait_result == WAIT_OBJECT_0 + 2)
+        WaitForMultipleObjects(2, wait_events, FALSE, timeout);
+        if (!gp->active)
         {
-            AcquireSRWLockExclusive(&gp->vibr_lock);
-            gp->small_motor = 0;
-            gp->big_motor = 0;
-            ReleaseSRWLockExclusive(&gp->vibr_lock);
-            wait_events[2] = dummy_event;
+            break;
         }
+        ResetEvent(gp->out_event);
 
+        BYTE desired[3];
+        desired[MI_VIBRATION_HEADER] = init_vibration[MI_VIBRATION_HEADER];
         AcquireSRWLockShared(&gp->vibr_lock);
-        if (gp->small_motor != vibration[MI_VIBRATION_SMALL_MOTOR] || gp->big_motor != vibration[MI_VIBRATION_BIG_MOTOR])
+        desired[MI_VIBRATION_SMALL_MOTOR] = gp->small_motor;
+        desired[MI_VIBRATION_BIG_MOTOR] = gp->big_motor;
+        ReleaseSRWLockShared(&gp->vibr_lock);
+
+        if (desired[MI_VIBRATION_SMALL_MOTOR] != vibration[MI_VIBRATION_SMALL_MOTOR]
+            || desired[MI_VIBRATION_BIG_MOTOR] != vibration[MI_VIBRATION_BIG_MOTOR])
         {
-            vibration[MI_VIBRATION_SMALL_MOTOR] = gp->small_motor;
-            vibration[MI_VIBRATION_BIG_MOTOR] = gp->big_motor;
-
-            if (gp->small_motor != 0 || gp->big_motor != 0)
+            if (hid_send_feature_report(gp->device, desired, sizeof(desired)) > 0)
             {
-                SetWaitableTimer(timer, &due_time, 0, NULL, NULL, FALSE);
-                wait_events[2] = timer;
+                vibration[MI_VIBRATION_SMALL_MOTOR] = desired[MI_VIBRATION_SMALL_MOTOR];
+                vibration[MI_VIBRATION_BIG_MOTOR] = desired[MI_VIBRATION_BIG_MOTOR];
+                timeout = INFINITE;
             }
-            else if (wait_events[2] == timer)
+            else
             {
-                CancelWaitableTimer(timer);
-                wait_events[2] = dummy_event;
+                // command failed, retry until it succeeds
+                timeout = MI_VIBRATION_RETRY_DELAY;
             }
-
-            ReleaseSRWLockShared(&gp->vibr_lock);
-            hid_send_feature_report(gp->device, vibration, sizeof(vibration));
         }
         else
         {
-            ReleaseSRWLockShared(&gp->vibr_lock);
+            timeout = INFINITE;
         }
-        ResetEvent(gp->out_event);
     }
 
-    // turn off vibration
-    hid_send_feature_report(gp->device, init_vibration, sizeof(init_vibration));
-
-    CloseHandle(dummy_event);
-    CloseHandle(timer);
+    // turn off vibration (bounded retries, the device may be gone already)
+    for (int i = 0; i < MI_VIBRATION_OFF_RETRIES; i++)
+    {
+        if (hid_send_feature_report(gp->device, init_vibration, sizeof(init_vibration)) > 0)
+        {
+            break;
+        }
+        Sleep(MI_VIBRATION_RETRY_DELAY);
+    }
 
     return 0;
 }
