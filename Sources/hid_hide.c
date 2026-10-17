@@ -287,8 +287,8 @@ static LPTSTR _hh_get_app_image_name()
             free(result_w);
 #endif /* UNICODE */
         }
-        free(mount_point);
     }
+    free(mount_point);
     return result;
 }
 

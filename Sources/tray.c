@@ -103,7 +103,7 @@ static HMENU _tray_menu(struct tray_menu *m, UINT *id)
         else
         {
             MENUITEMINFO item;
-            memset(&item, 0, sizeof(item));
+            item = (MENUITEMINFO){ 0 };
             item.cbSize = sizeof(MENUITEMINFO);
             item.fMask = MIIM_ID | MIIM_TYPE | MIIM_STATE | MIIM_DATA;
             item.fType = 0;
@@ -139,7 +139,7 @@ int tray_init(struct tray *tray)
         return -1;
     }
 
-    memset(&wc, 0, sizeof(wc));
+    wc = (WNDCLASSEX){ 0 };
     wc.cbSize = sizeof(WNDCLASSEX);
     wc.lpfnWndProc = _tray_wnd_proc;
     wc.hInstance = GetModuleHandle(NULL);
@@ -156,7 +156,7 @@ int tray_init(struct tray *tray)
     }
     UpdateWindow(hwnd);
 
-    memset(&nid, 0, sizeof(nid));
+    nid = (NOTIFYICONDATA){ 0 };
     nid.cbSize = sizeof(NOTIFYICONDATA);
     nid.hWnd = hwnd;
     nid.uID = 0;
@@ -235,7 +235,7 @@ void tray_register_device_notification(GUID filter, void (*cb)(UINT, LPTSTR))
     }
 
     DEV_BROADCAST_DEVICEINTERFACE dbdi;
-    memset(&dbdi, 0, sizeof(dbdi));
+    dbdi = (DEV_BROADCAST_DEVICEINTERFACE){ 0 };
     dbdi.dbcc_size = sizeof(dbdi);
     dbdi.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
     dbdi.dbcc_classguid = filter;
@@ -255,7 +255,7 @@ void tray_show_notification(UINT type, LPTSTR title, LPTSTR text)
     }
 
     NOTIFYICONDATA nid_info;
-    memmove(&nid_info, &nid, sizeof(NOTIFYICONDATA));
+    nid_info = nid;
     nid_info.uFlags |= NIF_INFO;
     _tcscpy(nid_info.szInfoTitle, title);
     _tcscpy(nid_info.szInfo, text);

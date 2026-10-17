@@ -1,5 +1,4 @@
 #include <stdio.h>
-#include <string.h>
 #include <tchar.h>
 #include <windows.h>
 #include <synchapi.h>
@@ -78,10 +77,16 @@ static void rebuild_tray_menu()
     struct tray_menu *prev_menu = tray.menu;
 
     AcquireSRWLockShared(&active_devices_lock);
-    int dyn_item_count = active_device_count > 0 ? active_device_count + 1 : 0;
+    int device_count = active_device_count;
+    int dyn_item_count = device_count > 0 ? device_count + 1 : 0;
     struct tray_menu *new_menu = (struct tray_menu *)malloc((dyn_item_count + 3) * sizeof(struct tray_menu));
+    if (new_menu == NULL)
+    {
+        ReleaseSRWLockShared(&active_devices_lock);
+        return;
+    }
     int index = 0;
-    for (; index < active_device_count; index++)
+    for (; index < device_count; index++)
     {
         new_menu[index] = *active_devices[index]->tray_menu;
     }
@@ -157,8 +162,7 @@ static BOOLEAN add_device(struct hid_device_info *device_info)
     int tray_text_length = _sctprintf(ACTIVE_DEVICE_MENU_TEMPLATE, active_device->index, BATTERY_NA_TEXT);
     active_device->tray_text = (LPTSTR)malloc((tray_text_length + 1) * sizeof(TCHAR));
     _stprintf(active_device->tray_text, ACTIVE_DEVICE_MENU_TEMPLATE, active_device->index, BATTERY_NA_TEXT);
-    active_device->tray_menu = (struct tray_menu *)malloc(sizeof(struct tray_menu));
-    memset(active_device->tray_menu, 0, sizeof(struct tray_menu));
+    active_device->tray_menu = (struct tray_menu *)calloc(1, sizeof(struct tray_menu));
     active_device->tray_menu->text = active_device->tray_text;
     active_device->hid_hidden = hid_hide_bind(device->device_info) == HID_HIDE_RESULT_OK;
 
@@ -206,8 +210,10 @@ static BOOLEAN remove_device(int mi_gamepad_id)
             free(active_devices[i]);
             if (i < active_device_count - 1)
             {
-                memmove(&active_devices[i], &active_devices[i + 1],
-                        sizeof(struct active_device *) * (active_device_count - i - 1));
+                for (int j = i; j < active_device_count - 1; j++)
+                {
+                    active_devices[j] = active_devices[j + 1];
+                }
             }
             active_device_count--;
             removed = TRUE;
