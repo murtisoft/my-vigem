@@ -138,6 +138,13 @@ int tray_init(struct tray *tray)
     {
         return -1;
     }
+    if (GetLastError() == ERROR_ALREADY_EXISTS)
+    {
+        // another instance is already running
+        CloseHandle(hmutex);
+        hmutex = NULL;
+        return 1;
+    }
 
     wc = (WNDCLASSEX){ 0 };
     wc.cbSize = sizeof(WNDCLASSEX);

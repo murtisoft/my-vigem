@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <string.h>
 #include <tchar.h>
 #include <windows.h>
 #include <synchapi.h>
@@ -413,7 +414,13 @@ static void quit_cb(struct tray_menu *item)
 int main()
 {
     rebuild_tray_menu();
-    if (tray_init(&tray) < 0)
+    int tray_res = tray_init(&tray);
+    if (tray_res > 0)
+    {
+        // already running, quit silently
+        return 0;
+    }
+    if (tray_res < 0)
     {
         printf("Failed to create tray\n");
         return 1;
