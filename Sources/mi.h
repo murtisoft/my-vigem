@@ -3,6 +3,8 @@
 
 #include <wtypes.h>
 
+struct hid_device;
+
 #define MI_HW_VENDOR_ID 0x2717
 #define MI_HW_PRODUCT_ID 0x3144
 
