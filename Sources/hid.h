@@ -35,6 +35,7 @@ struct hid_device
 GUID hid_get_interface_guid();
 struct hid_device_info *hid_enumerate(const LPTSTR *path_filters);
 BOOLEAN hid_reenable_device(struct hid_device_info *device_info);
+void hid_enable_disabled_devices(const LPTSTR *path_filters);
 BOOLEAN check_vendor_and_product(struct hid_device_info *device_info, USHORT vendor_id, USHORT product_id);
 struct hid_device_info *hid_clone_device_info(struct hid_device_info *device_info);
 void hid_free_device_info(struct hid_device_info *device_info);

@@ -10,6 +10,7 @@
 #include "hid.h"
 #include "mi.h"
 #include "hid_hide.h"
+#include "utils.h"
 
 #ifndef _DEBUG
 #pragma comment(linker, "/SUBSYSTEM:windows /ENTRY:mainCRTStartup")
@@ -117,9 +118,11 @@ static BOOLEAN add_device(struct hid_device_info *device_info)
         return FALSE;
     }
 
+    debug_log("add_device: " DBG_TSTR, device_info->symlink);
     struct hid_device *device = hid_open_device(device_info, TRUE, FALSE);
     if (device == NULL)
     {
+        debug_log("add_device: exclusive open failed, re-enabling device");
         if (hid_reenable_device(device_info))
         {
             device = hid_open_device(device_info, TRUE, FALSE);
@@ -132,6 +135,10 @@ static BOOLEAN add_device(struct hid_device_info *device_info)
         {
             device = hid_open_device(device_info, TRUE, TRUE);
         }
+    }
+    if (device == NULL)
+    {
+        debug_log("add_device: could not open device");
     }
 
     if (device == NULL)
@@ -232,6 +239,7 @@ static BOOLEAN remove_device(int mi_gamepad_id)
 static void refresh_devices()
 {
     LPTSTR mi_hw_path_filters[3] = { MI_HW_FILTER_WIN10, MI_HW_FILTER_WIN7, NULL };
+    hid_enable_disabled_devices(mi_hw_path_filters);
     struct hid_device_info *device_info = hid_enumerate(mi_hw_path_filters);
     struct hid_device_info *cur;
     BOOLEAN found = FALSE;
@@ -415,8 +423,15 @@ static void quit_cb(struct tray_menu *item)
     tray_exit();
 }
 
-int main()
+int main(int argc, char **argv)
 {
+    for (int i = 1; i < argc; i++)
+    {
+        if (strcmp(argv[i], "--debug") == 0)
+        {
+            debug_console_enable();
+        }
+    }
     rebuild_tray_menu();
     int tray_res = tray_init(&tray);
     if (tray_res > 0)

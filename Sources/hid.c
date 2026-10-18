@@ -234,28 +234,57 @@ struct hid_device_info *hid_enumerate(const LPTSTR *path_filters)
     return root_dev;
 }
 
-BOOLEAN hid_reenable_device(struct hid_device_info *device_info)
+#define HID_DEVNODE_STATE_TIMEOUT_MS 10000
+#define HID_DEVNODE_STATE_POLL_MS 20
+#define HID_ENABLE_ATTEMPTS 3
+
+// Waits until the PnP manager reports the devnode as started (enabled) or as disabled
+static BOOLEAN _hid_wait_devnode_state(DEVINST devinst, BOOLEAN want_enabled)
 {
-    GUID interface_guid = hid_get_interface_guid();
-    SP_DEVINFO_DATA devinfo_data;
-    HDEVINFO device_info_set = INVALID_HANDLE_VALUE;
-    DWORD required_size = 0;
-
-    devinfo_data = (SP_DEVINFO_DATA){ 0 };
-    devinfo_data.cbSize = sizeof(SP_DEVINFO_DATA);
-
-    device_info_set = SetupDiGetClassDevs(&interface_guid, device_info->instance_path, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-    if (device_info_set == INVALID_HANDLE_VALUE)
+    ULONGLONG deadline = GetTickCount64() + HID_DEVNODE_STATE_TIMEOUT_MS;
+    ULONG status = 0, problem = 0;
+    CONFIGRET cr;
+    do
     {
-        return FALSE;
-    }
+        cr = CM_Get_DevNode_Status(&status, &problem, devinst, 0);
+        if (cr == CR_SUCCESS)
+        {
+            if (want_enabled)
+            {
+                if ((status & DN_STARTED) && !(status & DN_HAS_PROBLEM))
+                {
+                    return TRUE;
+                }
+            }
+            else if ((status & DN_HAS_PROBLEM) && problem == CM_PROB_DISABLED)
+            {
+                return TRUE;
+            }
+        }
+        Sleep(HID_DEVNODE_STATE_POLL_MS);
+    } while (GetTickCount64() < deadline);
+    debug_log("  timeout waiting for devnode to become %s (cr=0x%lX status=0x%lX problem=%lu)",
+              want_enabled ? "enabled" : "disabled", (unsigned long)cr, status, problem);
+    return FALSE;
+}
 
-    if (!SetupDiEnumDeviceInfo(device_info_set, 0, &devinfo_data) || SetupDiEnumDeviceInfo(device_info_set, 1, &devinfo_data))
+static void _hid_log_install_params(HDEVINFO set, SP_DEVINFO_DATA *data)
+{
+    SP_DEVINSTALL_PARAMS params = { .cbSize = sizeof(SP_DEVINSTALL_PARAMS) };
+    if (SetupDiGetDeviceInstallParams(set, data, &params))
     {
-        SetupDiDestroyDeviceInfoList(device_info_set);
-        return FALSE;
+        debug_log("  install params: Flags=0x%lX (needreboot=%d needrestart=%d)", params.Flags,
+                  (params.Flags & DI_NEEDREBOOT) ? 1 : 0, (params.Flags & DI_NEEDRESTART) ? 1 : 0);
     }
+    else
+    {
+        debug_log("  SetupDiGetDeviceInstallParams failed, error=%lu", GetLastError());
+    }
+}
 
+static BOOLEAN _hid_change_state(HDEVINFO set, SP_DEVINFO_DATA *data, DWORD state_change)
+{
+    const char *what = (state_change == DICS_ENABLE) ? "DICS_ENABLE" : "DICS_DISABLE";
     SP_PROPCHANGE_PARAMS pc_params =
     {
         .ClassInstallHeader =
@@ -263,21 +292,131 @@ BOOLEAN hid_reenable_device(struct hid_device_info *device_info)
             .cbSize = sizeof(SP_CLASSINSTALL_HEADER),
             .InstallFunction = DIF_PROPERTYCHANGE
         },
-        .StateChange = DICS_DISABLE,
+        .StateChange = state_change,
         .Scope = DICS_FLAG_GLOBAL,
         .HwProfile = 0
     };
-    BOOLEAN res;
-    res = SetupDiSetClassInstallParams(device_info_set, &devinfo_data, (PSP_CLASSINSTALL_HEADER)&pc_params,
-                                       sizeof(SP_PROPCHANGE_PARAMS));
-    res = res && SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, device_info_set, &devinfo_data);
-    pc_params.StateChange = DICS_ENABLE;
-    res = res && SetupDiSetClassInstallParams(device_info_set, &devinfo_data, (PSP_CLASSINSTALL_HEADER)&pc_params,
-                                              sizeof(SP_PROPCHANGE_PARAMS));
-    res = res && SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, device_info_set, &devinfo_data);
+    if (!SetupDiSetClassInstallParams(set, data, (PSP_CLASSINSTALL_HEADER)&pc_params, sizeof(SP_PROPCHANGE_PARAMS)))
+    {
+        debug_log("  SetupDiSetClassInstallParams(%s) failed, error=%lu", what, GetLastError());
+        return FALSE;
+    }
+    if (!SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, set, data))
+    {
+        debug_log("  SetupDiCallClassInstaller(%s) failed, error=%lu", what, GetLastError());
+        _hid_log_install_params(set, data);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+BOOLEAN hid_reenable_device(struct hid_device_info *device_info)
+{
+    GUID interface_guid = hid_get_interface_guid();
+    SP_DEVINFO_DATA devinfo_data;
+    HDEVINFO device_info_set = INVALID_HANDLE_VALUE;
+
+    debug_log("hid_reenable_device: " DBG_TSTR, device_info->instance_path);
+
+    devinfo_data = (SP_DEVINFO_DATA){ 0 };
+    devinfo_data.cbSize = sizeof(SP_DEVINFO_DATA);
+
+    device_info_set = SetupDiGetClassDevs(&interface_guid, device_info->instance_path, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (device_info_set == INVALID_HANDLE_VALUE)
+    {
+        debug_log("  SetupDiGetClassDevs failed, error=%lu", GetLastError());
+        return FALSE;
+    }
+
+    if (!SetupDiEnumDeviceInfo(device_info_set, 0, &devinfo_data))
+    {
+        debug_log("  SetupDiEnumDeviceInfo(0) failed, error=%lu", GetLastError());
+        SetupDiDestroyDeviceInfoList(device_info_set);
+        return FALSE;
+    }
+    SP_DEVINFO_DATA extra = { .cbSize = sizeof(SP_DEVINFO_DATA) };
+    if (SetupDiEnumDeviceInfo(device_info_set, 1, &extra))
+    {
+        debug_log("  more than one device matched the instance path, aborting");
+        SetupDiDestroyDeviceInfoList(device_info_set);
+        return FALSE;
+    }
+
+    BOOLEAN res = _hid_change_state(device_info_set, &devinfo_data, DICS_DISABLE);
+    if (res)
+    {
+        _hid_wait_devnode_state(devinfo_data.DevInst, FALSE);
+    }
+
+    // never leave the device disabled: retry the enable, then fall back to the CM API
+    res = FALSE;
+    for (int attempt = 1; attempt <= HID_ENABLE_ATTEMPTS && !res; attempt++)
+    {
+        if (attempt > 1)
+        {
+            debug_log("  enable attempt %d/%d", attempt, HID_ENABLE_ATTEMPTS);
+        }
+        res = _hid_change_state(device_info_set, &devinfo_data, DICS_ENABLE) &&
+              _hid_wait_devnode_state(devinfo_data.DevInst, TRUE);
+        if (!res)
+        {
+            CONFIGRET cr = CM_Enable_DevNode(devinfo_data.DevInst, 0);
+            debug_log("  CM_Enable_DevNode cr=0x%lX", (unsigned long)cr);
+            res = (cr == CR_SUCCESS) && _hid_wait_devnode_state(devinfo_data.DevInst, TRUE);
+        }
+    }
+    debug_log("hid_reenable_device: %s", res ? "success" : "FAILED, device may be left disabled");
 
     SetupDiDestroyDeviceInfoList(device_info_set);
     return res;
+}
+
+// Enumeration skips disabled devices (their interface is gone), so a device left disabled by an
+// earlier failed re-enable is never seen again. Find such devnodes and enable them.
+void hid_enable_disabled_devices(const LPTSTR *path_filters)
+{
+    LPTSTR class_filter = _guid_to_str(&GUID_DEVCLASS_HIDCLASS);
+    DWORD required_size = 0;
+    if (CM_Get_Device_ID_List_Size(&required_size, class_filter, CM_GETIDLIST_FILTER_CLASS) != CR_SUCCESS)
+    {
+        debug_log("hid_enable_disabled_devices: CM_Get_Device_ID_List_Size failed");
+        free(class_filter);
+        return;
+    }
+    LPTSTR list = (LPTSTR)malloc(required_size * sizeof(TCHAR));
+    if (list != NULL && CM_Get_Device_ID_List(class_filter, list, required_size, CM_GETIDLIST_FILTER_CLASS) == CR_SUCCESS)
+    {
+        for (DWORD i = 0, start = 0; i < required_size; i++)
+        {
+            if (list[i] != 0)
+            {
+                continue;
+            }
+            LPTSTR id = &list[start];
+            BOOLEAN matched = (path_filters == NULL);
+            for (const LPTSTR *pfilter = path_filters; !matched && pfilter != NULL && *pfilter != NULL; pfilter++)
+            {
+                matched = (_tcsistr(id, *pfilter) != NULL);
+            }
+            DEVINST devinst;
+            ULONG status = 0, problem = 0;
+            if (i > start && matched && CM_Locate_DevNode(&devinst, id, CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS &&
+                CM_Get_DevNode_Status(&status, &problem, devinst, 0) == CR_SUCCESS &&
+                (status & DN_HAS_PROBLEM) && problem == CM_PROB_DISABLED)
+            {
+                debug_log("found disabled device " DBG_TSTR ", enabling", id);
+                CONFIGRET cr = CM_Enable_DevNode(devinst, 0);
+                debug_log("  CM_Enable_DevNode cr=0x%lX", (unsigned long)cr);
+                if (cr == CR_SUCCESS)
+                {
+                    _hid_wait_devnode_state(devinst, TRUE);
+                }
+            }
+            start = i + 1;
+        }
+    }
+    free(list);
+    free(class_filter);
 }
 
 BOOLEAN check_vendor_and_product(struct hid_device_info *device_info, USHORT vendor_id, USHORT product_id)
@@ -355,12 +494,14 @@ struct hid_device *hid_open_device(struct hid_device_info *device_info, BOOLEAN 
     HANDLE handle = CreateFile(device_info->symlink, desired_access, share_mode, &security, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, 0);
     if (handle == INVALID_HANDLE_VALUE)
     {
+        debug_log("hid_open_device(rw=%d, shared=%d): CreateFile failed, error=%lu", access_rw, shared, GetLastError());
         return NULL;
     }
 
     PHIDP_PREPARSED_DATA pp_data = NULL;
     if (!HidD_GetPreparsedData(handle, &pp_data))
     {
+        debug_log("hid_open_device(rw=%d, shared=%d): HidD_GetPreparsedData failed, error=%lu", access_rw, shared, GetLastError());
         CloseHandle(handle);
         return NULL;
     }
@@ -368,6 +509,7 @@ struct hid_device *hid_open_device(struct hid_device_info *device_info, BOOLEAN 
     HIDP_CAPS caps;
     if (HidP_GetCaps(pp_data, &caps) != HIDP_STATUS_SUCCESS)
     {
+        debug_log("hid_open_device(rw=%d, shared=%d): HidP_GetCaps failed", access_rw, shared);
         HidD_FreePreparsedData(pp_data);
         CloseHandle(handle);
         return NULL;

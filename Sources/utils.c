@@ -1,6 +1,9 @@
 #include <ctype.h>
 #include <stddef.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <tchar.h>
+#include <windows.h>
 
 #include "utils.h"
 
@@ -76,4 +79,29 @@ void _mem_copy(void *dst, const void *src, size_t size)
             d[i - 1] = s[i - 1];
         }
     }
+}
+
+void debug_console_enable(void)
+{
+    if (!AttachConsole(ATTACH_PARENT_PROCESS) && !AllocConsole())
+    {
+        return;
+    }
+    FILE *f;
+    freopen_s(&f, "CONOUT$", "w", stdout);
+    freopen_s(&f, "CONOUT$", "w", stderr);
+    setvbuf(stdout, NULL, _IONBF, 0);
+}
+
+void debug_log(const char *fmt, ...)
+{
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    printf("[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    va_list args;
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);
+    printf("\n");
+    fflush(stdout);
 }
