@@ -7,6 +7,7 @@ XBox360 controller emulation for Xiaomi gamepad. Supports multiple devices and v
 - Resolves disabled HID device getting stuck on windows 11
 - Refreshing devices resets everything
 - Resolves infinite rumble with proper command retries, instead of a 2 second safety.
+- Only allows a single instance running.
 
 ## Requirements
 

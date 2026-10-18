@@ -17,6 +17,7 @@
 #endif
 
 #define MAX_ACTIVE_DEVICE_COUNT 4
+#define REATTACH_REMOVE_TIMEOUT_MS 5000
 #ifdef UNICODE
 #define ACTIVE_DEVICE_MENU_TEMPLATE TEXT("#%d Xiaomi Gamepad (batt. %ls)")
 #else
@@ -41,6 +42,10 @@ static int last_active_device_index = 0;
 static int active_device_count = 0;
 static struct active_device *active_devices[MAX_ACTIVE_DEVICE_COUNT];
 static SRWLOCK active_devices_lock = SRWLOCK_INIT;
+// signaled whenever a device has been removed from active_devices
+static CONDITION_VARIABLE active_devices_removed_cv = CONDITION_VARIABLE_INIT;
+// set while a full refresh removes and re-adds all devices, to suppress the routine notifications
+static volatile LONG reattaching = 0;
 static PVIGEM_CLIENT vigem_client;
 static BOOLEAN vigem_connected = FALSE;
 static BOOLEAN hid_hide_connected = FALSE;
@@ -186,8 +191,11 @@ static BOOLEAN add_device(struct hid_device_info *device_info)
     tray_update(&tray);
     if (vigem_connected)
     {
-        tray_show_notification(NT_TRAY_INFO, TEXT("Add new device"),
-                               TEXT("Device added successfully"));
+        if (!reattaching)
+        {
+            tray_show_notification(NT_TRAY_INFO, TEXT("Add new device"),
+                                   TEXT("Device added successfully"));
+        }
     }
     else
     {
@@ -228,6 +236,7 @@ static BOOLEAN remove_device(int mi_gamepad_id)
                 }
             }
             active_device_count--;
+            WakeAllConditionVariable(&active_devices_removed_cv);
             removed = TRUE;
             break;
         }
@@ -297,12 +306,79 @@ static void refresh_devices()
     }
 }
 
+// Removes all virtual pads and attaches them again, keeping their order.
+static void reattach_devices()
+{
+    LPTSTR saved[MAX_ACTIVE_DEVICE_COUNT];
+    int saved_count = 0;
+
+    InterlockedExchange(&reattaching, 1);
+
+    // remember the current order and ask every gamepad to stop
+    AcquireSRWLockShared(&active_devices_lock);
+    for (int i = 0; i < active_device_count; i++)
+    {
+        LPTSTR symlink = active_devices[i]->src_device->device_info->symlink;
+        saved[saved_count] = (LPTSTR)malloc((_tcslen(symlink) + 1) * sizeof(TCHAR));
+        _tcscpy(saved[saved_count], symlink);
+        saved_count++;
+        mi_gamepad_stop(active_devices[i]->src_gamepad_id);
+    }
+    ReleaseSRWLockShared(&active_devices_lock);
+
+    // wait until all of them are removed
+    ULONGLONG deadline = GetTickCount64() + REATTACH_REMOVE_TIMEOUT_MS;
+    AcquireSRWLockShared(&active_devices_lock);
+    while (active_device_count > 0)
+    {
+        ULONGLONG now = GetTickCount64();
+        if (now >= deadline ||
+            !SleepConditionVariableSRW(&active_devices_removed_cv, &active_devices_lock, (DWORD)(deadline - now),
+                                       CONDITION_VARIABLE_LOCKMODE_SHARED))
+        {
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&active_devices_lock);
+
+    // add them back in the remembered order, so the numbering stays the same
+    last_active_device_index = 0;
+    if (saved_count > 0)
+    {
+        LPTSTR mi_hw_path_filters[3] = { MI_HW_FILTER_WIN10, MI_HW_FILTER_WIN7, NULL };
+        struct hid_device_info *device_info = hid_enumerate(mi_hw_path_filters);
+        for (int i = 0; i < saved_count; i++)
+        {
+            for (struct hid_device_info *cur = device_info; cur != NULL; cur = cur->next)
+            {
+                if (_tcscmp(saved[i], cur->symlink) == 0)
+                {
+                    add_device(cur);
+                    break;
+                }
+            }
+            free(saved[i]);
+        }
+        while (device_info)
+        {
+            struct hid_device_info *next = device_info->next;
+            hid_free_device_info(device_info);
+            device_info = next;
+        }
+    }
+
+    // pick up anything that was not active before
+    refresh_devices();
+    InterlockedExchange(&reattaching, 0);
+}
+
 // Device refreshes (enumeration, re-enabling, opening) can block for seconds, so they run on a
 // worker thread and the tray thread only requests them. Requests made while a refresh is running
 // are coalesced into a single follow-up refresh.
 static HANDLE refresh_event = NULL;
 static HANDLE refresh_thread = NULL;
 static volatile LONG refresh_quit = 0;
+static volatile LONG refresh_full = 0;
 
 static DWORD WINAPI refresh_thread_proc(LPVOID param)
 {
@@ -313,13 +389,26 @@ static DWORD WINAPI refresh_thread_proc(LPVOID param)
         {
             break;
         }
-        refresh_devices();
+        if (InterlockedExchange(&refresh_full, 0))
+        {
+            reattach_devices();
+        }
+        else
+        {
+            refresh_devices();
+        }
     }
     return 0;
 }
 
 static void request_refresh(void)
 {
+    SetEvent(refresh_event);
+}
+
+static void request_full_refresh(void)
+{
+    InterlockedExchange(&refresh_full, 1);
     SetEvent(refresh_event);
 }
 
@@ -422,7 +511,10 @@ static void mi_gamepad_stop_cb(int gamepad_id, BYTE break_reason)
     {
         rebuild_tray_menu();
         tray_update(&tray);
-        tray_show_notification(ntf_type, TEXT("Remove device"), ntf_text);
+        if (!(reattaching && break_reason == MI_BREAK_REASON_REQUESTED))
+        {
+            tray_show_notification(ntf_type, TEXT("Remove device"), ntf_text);
+        }
     }
 }
 
@@ -438,7 +530,7 @@ static void refresh_cb(struct tray_menu *item)
     (void)item;
     printf("Refresh\n");
     fflush(stdout);
-    request_refresh();
+    request_full_refresh();
 }
 
 static void quit_cb(struct tray_menu *item)
