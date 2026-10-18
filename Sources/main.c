@@ -297,6 +297,32 @@ static void refresh_devices()
     }
 }
 
+// Device refreshes (enumeration, re-enabling, opening) can block for seconds, so they run on a
+// worker thread and the tray thread only requests them. Requests made while a refresh is running
+// are coalesced into a single follow-up refresh.
+static HANDLE refresh_event = NULL;
+static HANDLE refresh_thread = NULL;
+static volatile LONG refresh_quit = 0;
+
+static DWORD WINAPI refresh_thread_proc(LPVOID param)
+{
+    (void)param;
+    while (WaitForSingleObject(refresh_event, INFINITE) == WAIT_OBJECT_0)
+    {
+        if (InterlockedCompareExchange(&refresh_quit, 0, 0))
+        {
+            break;
+        }
+        refresh_devices();
+    }
+    return 0;
+}
+
+static void request_refresh(void)
+{
+    SetEvent(refresh_event);
+}
+
 static void device_change_cb(UINT op, LPTSTR path)
 {
     // refresh devices regardless operation type
@@ -306,7 +332,7 @@ static void device_change_cb(UINT op, LPTSTR path)
     printf("Device operation %d with path %s\n", op, path);
 #endif
     fflush(stdout);
-    refresh_devices();
+    request_refresh();
 }
 
 static void mi_gamepad_update_cb(int gamepad_id, struct mi_state *state)
@@ -412,7 +438,7 @@ static void refresh_cb(struct tray_menu *item)
     (void)item;
     printf("Refresh\n");
     fflush(stdout);
-    refresh_devices();
+    request_refresh();
 }
 
 static void quit_cb(struct tray_menu *item)
@@ -475,13 +501,21 @@ int main(int argc, char **argv)
     {
         hid_hide_connected = TRUE;
     }
-    refresh_devices();
+    refresh_event = CreateEvent(NULL, FALSE, FALSE, NULL);
+    refresh_thread = CreateThread(NULL, 0, refresh_thread_proc, NULL, 0, NULL);
+    request_refresh();
     tray_register_device_notification(hid_get_interface_guid(), device_change_cb);
 
     while (tray_loop(TRUE) == 0)
     {
         ;
     }
+
+    InterlockedExchange(&refresh_quit, 1);
+    SetEvent(refresh_event);
+    WaitForSingleObject(refresh_thread, 15000);
+    CloseHandle(refresh_thread);
+    CloseHandle(refresh_event);
 
     AcquireSRWLockExclusive(&active_devices_lock);
     for (int i = 0; i < active_device_count; i++)
