@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(my-vigem VERSION 1.3.0 LANGUAGES C CXX RC)
+project(my-vigem VERSION 1.4.0 LANGUAGES C CXX RC)
 
 add_definitions(-DWIN32 -DUNICODE -D_UNICODE -D_CRT_NON_CONFORMING_SWPRINTFS)
 
