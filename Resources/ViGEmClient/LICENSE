@@ -1,7 +1,6 @@
-/*
 MIT License
 
-Copyright (c) 2017-2019 Nefarius Software Solutions e.U. and Contributors
+Copyright (c) 2018 Benjamin Höglinger-Stelzer
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -20,53 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-*/
-
-
-#pragma once
-
-//
-// TODO: this is... not optimal. Improve in the future.
-// 
-#define VIGEM_TARGETS_MAX   USHRT_MAX
-
-
-//
-// Represents a driver connection object.
-// 
-typedef struct _VIGEM_CLIENT_T
-{
-    HANDLE hBusDevice;
-
-} VIGEM_CLIENT;
-
-//
-// Represents the (connection) state of a target device object.
-// 
-typedef enum _VIGEM_TARGET_STATE
-{
-    VIGEM_TARGET_NEW,
-    VIGEM_TARGET_INITIALIZED,
-    VIGEM_TARGET_CONNECTED,
-    VIGEM_TARGET_DISCONNECTED
-} VIGEM_TARGET_STATE, *PVIGEM_TARGET_STATE;
-
-
-
-//
-// Represents a virtual gamepad object.
-// 
-typedef struct _VIGEM_TARGET_T
-{
-    ULONG Size;
-    ULONG SerialNo;
-    VIGEM_TARGET_STATE State;
-    USHORT VendorId;
-    USHORT ProductId;
-    VIGEM_TARGET_TYPE Type;
-    FARPROC Notification;
-    LPVOID NotificationUserData;
-    BOOLEAN IsWaitReadyUnsupported;
-
-	HANDLE cancelNotificationThreadEvent;
-} VIGEM_TARGET;

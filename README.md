@@ -14,4 +14,4 @@ XBox360 controller emulation for Xiaomi gamepad. Supports multiple devices and v
 
 ## Xiaomi Gamepad
 
-![Controller](Resources/MiController.webp)
+![Controller](Resources/Bitmaps/MiController.webp)

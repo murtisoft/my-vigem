@@ -4,7 +4,7 @@ project(my-vigem VERSION 1.3.0 LANGUAGES C CXX RC)
 add_definitions(-DWIN32 -DUNICODE -D_UNICODE -D_CRT_NON_CONFORMING_SWPRINTFS)
 
 # Windows resource script (icon + version info), generated into the build dir
-set(APP_ICON_PATH "${CMAKE_CURRENT_SOURCE_DIR}/Resources/MiPad.ico")
+set(APP_ICON_PATH "${CMAKE_CURRENT_SOURCE_DIR}/Resources/Bitmaps/MiPad.ico")
 set(APP_VERSION_COMMA "${PROJECT_VERSION_MAJOR},${PROJECT_VERSION_MINOR},${PROJECT_VERSION_PATCH},0")
 set(APP_VERSION_DOT "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}.${PROJECT_VERSION_PATCH}.0")
 string(CONFIGURE [=[
@@ -38,12 +38,12 @@ file(GENERATE OUTPUT "${APP_RC_FILE}" CONTENT "${APP_RC_CONTENT}")
 
 add_executable(my-vigem WIN32
     Sources/main.c Sources/utils.c Sources/tray.c Sources/hid.c Sources/hid_hide.c Sources/mi.c
-    Sources/lib/ViGEmClient/ViGEmClient.cpp
+    Resources/ViGEmClient/src/ViGEmClient.cpp
     "${APP_RC_FILE}")
 
-target_include_directories(my-vigem PRIVATE Sources/include)
+target_include_directories(my-vigem PRIVATE Resources/ViGEmClient/include)
 # Silence false positives from the vendored ViGEm headers and Clazy
-target_compile_options(my-vigem PRIVATE -Wno-pragma-pack -Wno-unused-command-line-argument)
+target_compile_options(my-vigem PRIVATE)
 target_link_libraries(my-vigem PRIVATE
     setupapi hid dbghelp cfgmgr32 user32 shell32 advapi32 ole32)
 target_link_options(my-vigem PRIVATE -static -static-libgcc -static-libstdc++)
