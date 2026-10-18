@@ -16,7 +16,11 @@
 #endif
 
 #define MAX_ACTIVE_DEVICE_COUNT 4
+#ifdef UNICODE
+#define ACTIVE_DEVICE_MENU_TEMPLATE TEXT("#%d Xiaomi Gamepad (batt. %ls)")
+#else
 #define ACTIVE_DEVICE_MENU_TEMPLATE TEXT("#%d Xiaomi Gamepad (batt. %s)")
+#endif
 #define BATTERY_NA_TEXT TEXT("N/A")
 
 struct active_device
