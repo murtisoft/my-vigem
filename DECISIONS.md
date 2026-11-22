@@ -23,7 +23,8 @@ Durable project choices, deduced from the code. Follow them; fix a line when a s
 - Per gamepad (`mi.c`): one input thread, one output (vibration) thread, one delay thread, stopped via `stopping_event`; input thread cleans everything up and calls `stop_cb` last.
 - `active_devices` is guarded by an SRW lock; removals signal a condition variable.
 - Device refreshes run on a single worker thread; the tray thread only sets an event. Requests are coalesced; a reset (`Reset Gamepads`) wins over a normal refresh.
-- Tray UI calls come from the worker/input threads directly (`tray_update`, notifications).
+- Tray UI calls come from the worker/input threads directly (notifications); menu text, menu array and `tray_update` changes go through `refresh_tray` (`tray_ui_lock`, serialized). `tray_update` does no cross-thread `SendMessage` (it would deadlock with that lock).
+- ViGEm (`vigem_*`) is NOT thread safe: after startup every call runs under `vigem_lock` (`vigem_release_target` for teardown), and never under `tray_ui_lock` or `active_devices_lock` (unregistering a notification can wait for its callback, which takes both); `remove_device` releases the target after dropping its lock.
 
 ## Behavior (fork features)
 - Single instance via named mutex `MI-VIGEM`; a second instance exits silently.
@@ -34,10 +35,11 @@ Durable project choices, deduced from the code. Follow them; fix a line when a s
 - Re-enable: disable, wait for state, then enable with up to 3 attempts and a `CM_Enable_DevNode` fallback; each state change waits up to 10 s (20 ms poll).
 - Win11 keeps the HID devnode and the pending read after the pad powers off (Win10 failed the read), so the input thread probes with a feature report `0x20` (current motor values, private buffer) after 300 silent 1 s read timeouts (the pad's idle shutdown is 300 s; earlier probing might keep it awake); a failed probe ends the pad (write error).
 - Rumble retries a failed command every 50 ms until it works (no timed safety stop); on stop, vibration-off is retried up to 20 times.
-- If ViGEmBus is missing/incompatible the app still runs and lists devices, with an error/warning notification.
+- If ViGEmBus is missing/incompatible, or adding a pad's target fails, the app still runs and lists devices, with an error/warning notification; only pads with `tgt_added` are emulated or removed from the bus.
+- The "device count limit" warning is shown once until a pad is removed.
 
 ## HidHide
-- Optional: if the driver is missing, the app works without hiding.
+- Optional: if the driver is missing, the app works without hiding. Same if our exe's NT path cannot be resolved: init fails (error notification) and nothing is hidden, since we could not whitelist ourselves.
 - On init: whitelist our exe (NT device path) unless HidHide is in inverse mode (then remove it), and activate HidHide.
 - Per device: add instance path and its parent (container) path to the blacklist; remove both on unbind.
 - On exit: restore HidHide's initial active state; the blacklist/whitelist entries we added are not otherwise restored besides per-device unbind.

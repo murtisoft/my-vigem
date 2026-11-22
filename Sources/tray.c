@@ -180,11 +180,15 @@ int tray_loop(BOOLEAN blocking)
     MSG msg;
     if (blocking)
     {
-        GetMessage(&msg, NULL, 0, 0);
+        // 0 = WM_QUIT, -1 = error: both end the loop
+        if (GetMessage(&msg, NULL, 0, 0) <= 0)
+        {
+            return -1;
+        }
     }
-    else
+    else if (!PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
     {
-        PeekMessage(&msg, NULL, 0, 0, PM_REMOVE);
+        return 0;
     }
     if (msg.message == WM_QUIT)
     {
@@ -200,7 +204,6 @@ void tray_update(struct tray *tray)
     HMENU prevmenu = hmenu;
     UINT id = ID_TRAY_FIRST;
     hmenu = _tray_menu(tray->menu, &id);
-    SendMessage(hwnd, WM_INITMENUPOPUP, (WPARAM)hmenu, 0);
     HICON hicon = LoadIcon(wc.hInstance, tray->icon);
     if (nid.hIcon)
     {
