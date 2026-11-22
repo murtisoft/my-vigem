@@ -33,7 +33,8 @@ struct active_device
     struct hid_device *src_device;
     int src_gamepad_id;
     int src_battery_level;
-    PVIGEM_TARGET tgt_device;
+    PVIGEM_TARGET tgt_device; // NULL if ViGEm is not connected
+    BOOLEAN tgt_added; // the target was added to the bus (needs unregister + remove)
     XUSB_REPORT tgt_report;
     LPTSTR tray_text;
     struct tray_menu *tray_menu;
@@ -49,6 +50,8 @@ static int _device_number(const struct active_device *device)
 
 static int last_active_device_index = 0;
 static int active_device_count = 0;
+// the "device count limit" notification is shown once until a pad is removed
+static BOOLEAN limit_notified = FALSE;
 static struct active_device *active_devices[MAX_ACTIVE_DEVICE_COUNT];
 static SRWLOCK active_devices_lock = SRWLOCK_INIT;
 // signaled whenever a device has been removed from active_devices
@@ -57,6 +60,25 @@ static CONDITION_VARIABLE active_devices_removed_cv = CONDITION_VARIABLE_INIT;
 static volatile LONG reattaching = 0;
 static PVIGEM_CLIENT vigem_client;
 static BOOLEAN vigem_connected = FALSE;
+// ViGEm is not thread safe: every vigem_* call after startup runs under this lock. Never call ViGEm while holding
+// active_devices_lock or tray_ui_lock (unregistering a notification can wait for its callback, which takes both).
+static SRWLOCK vigem_lock = SRWLOCK_INIT;
+
+static void vigem_release_target(PVIGEM_TARGET target, BOOLEAN added)
+{
+    if (target == NULL)
+    {
+        return;
+    }
+    AcquireSRWLockExclusive(&vigem_lock);
+    if (added)
+    {
+        vigem_target_x360_unregister_notification(target);
+        vigem_target_remove(vigem_client, target);
+    }
+    vigem_target_free(target);
+    ReleaseSRWLockExclusive(&vigem_lock);
+}
 static BOOLEAN hid_hide_connected = FALSE;
 
 // future declarations
@@ -176,12 +198,33 @@ static void rebuild_tray_menu()
     free(prev_menu);
 }
 
+// All tray menu changes go through here: texts, menu array and tray_update are touched by the input threads,
+// the worker, the ViGEm notification thread and the tray thread, so they are serialized by one lock.
+// dev (optional): pad whose menu text is rebuilt first. Never call ViGEm or take active_devices_lock exclusively while holding it.
+static SRWLOCK tray_ui_lock = SRWLOCK_INIT;
+
+static void refresh_tray(struct active_device *dev)
+{
+    AcquireSRWLockExclusive(&tray_ui_lock);
+    if (dev != NULL)
+    {
+        update_tray_text(dev);
+    }
+    rebuild_tray_menu();
+    tray_update(&tray);
+    ReleaseSRWLockExclusive(&tray_ui_lock);
+}
+
 static BOOLEAN add_device(struct hid_device_info *device_info)
 {
     if (active_device_count == MAX_ACTIVE_DEVICE_COUNT)
     {
-        tray_show_notification(NT_TRAY_WARNING, TEXT("Add new device"),
-                               TEXT("Device count limit reached"));
+        if (!limit_notified)
+        {
+            limit_notified = TRUE;
+            tray_show_notification(NT_TRAY_WARNING, TEXT("Add new device"),
+                                   TEXT("Device count limit reached"));
+        }
         return FALSE;
     }
 
@@ -233,12 +276,28 @@ static BOOLEAN add_device(struct hid_device_info *device_info)
     active_device->xinput_slot = -1; // learned from the LED notification, the slot is assigned later
     active_device->tray_text = NULL;
     active_device->tray_menu = NULL;
+    active_device->tgt_device = NULL;
+    active_device->tgt_added = FALSE;
+    _mem_zero(&active_device->tgt_report, sizeof(active_device->tgt_report));
     if (vigem_connected)
     {
+        AcquireSRWLockExclusive(&vigem_lock);
         active_device->tgt_device = vigem_target_x360_alloc();
-        vigem_target_add(vigem_client, active_device->tgt_device);
-        vigem_target_x360_register_notification(vigem_client, active_device->tgt_device, x360_notification_cb,
-                                                (LPVOID)active_device);
+        if (active_device->tgt_device != NULL)
+        {
+            VIGEM_ERROR add_res = vigem_target_add(vigem_client, active_device->tgt_device);
+            if (add_res == VIGEM_ERROR_NONE)
+            {
+                active_device->tgt_added = TRUE;
+                vigem_target_x360_register_notification(vigem_client, active_device->tgt_device, x360_notification_cb,
+                                                        (LPVOID)active_device);
+            }
+            else
+            {
+                debug_log("add_device: vigem_target_add failed, error=0x%X", (unsigned)add_res);
+            }
+        }
+        ReleaseSRWLockExclusive(&vigem_lock);
     }
     int tray_text_length = _sctprintf(ACTIVE_DEVICE_MENU_TEMPLATE, _device_number(active_device), BATTERY_NA_TEXT);
     active_device->tray_text = (LPTSTR)malloc((tray_text_length + 1) * sizeof(TCHAR));
@@ -253,9 +312,8 @@ static BOOLEAN add_device(struct hid_device_info *device_info)
     active_devices[active_device_count++] = active_device;
     ReleaseSRWLockExclusive(&active_devices_lock);
 
-    rebuild_tray_menu();
-    tray_update(&tray);
-    if (vigem_connected)
+    refresh_tray(NULL);
+    if (active_device->tgt_added)
     {
         if (!reattaching)
         {
@@ -275,6 +333,8 @@ static BOOLEAN remove_device(int mi_gamepad_id)
 {
     debug_log("remove_device: gamepad %d", mi_gamepad_id);
     BOOLEAN removed = FALSE;
+    PVIGEM_TARGET tgt_device = NULL;
+    BOOLEAN tgt_added = FALSE;
     AcquireSRWLockExclusive(&active_devices_lock);
     for (int i = 0; i < active_device_count; i++)
     {
@@ -286,12 +346,9 @@ static BOOLEAN remove_device(int mi_gamepad_id)
             }
             hid_close_device(active_devices[i]->src_device);
             hid_free_device(active_devices[i]->src_device);
-            if (vigem_connected)
-            {
-                vigem_target_x360_unregister_notification(active_devices[i]->tgt_device);
-                vigem_target_remove(vigem_client, active_devices[i]->tgt_device);
-                vigem_target_free(active_devices[i]->tgt_device);
-            }
+            // the ViGEm target is released after the lock is dropped
+            tgt_device = active_devices[i]->tgt_device;
+            tgt_added = active_devices[i]->tgt_added;
             free(active_devices[i]->tray_menu);
             free(active_devices[i]->tray_text);
             free(active_devices[i]);
@@ -303,12 +360,14 @@ static BOOLEAN remove_device(int mi_gamepad_id)
                 }
             }
             active_device_count--;
+            limit_notified = FALSE;
             WakeAllConditionVariable(&active_devices_removed_cv);
             removed = TRUE;
             break;
         }
     }
     ReleaseSRWLockExclusive(&active_devices_lock);
+    vigem_release_target(tgt_device, tgt_added);
     return removed;
 }
 
@@ -506,12 +565,10 @@ static void mi_gamepad_update_cb(int gamepad_id, struct mi_state *state)
     if (active_device->src_battery_level != state->battery)
     {
         active_device->src_battery_level = state->battery;
-        update_tray_text(active_device);
-        rebuild_tray_menu();
-        tray_update(&tray);
+        refresh_tray(active_device);
     }
 
-    if (vigem_connected)
+    if (active_device->tgt_added)
     {
         active_device->tgt_report.wButtons = 0;
         active_device->tgt_report.wButtons |= (state->buttons & MI_BUTTON_UP) != 0 ? XUSB_GAMEPAD_DPAD_UP : 0;
@@ -535,7 +592,9 @@ static void mi_gamepad_update_cb(int gamepad_id, struct mi_state *state)
         active_device->tgt_report.sThumbLY = _map_byte_to_short(state->left_stick_y, TRUE);
         active_device->tgt_report.sThumbRX = _map_byte_to_short(state->right_stick_x, FALSE);
         active_device->tgt_report.sThumbRY = _map_byte_to_short(state->right_stick_y, TRUE);
+        AcquireSRWLockExclusive(&vigem_lock);
         vigem_target_x360_update(vigem_client, active_device->tgt_device, active_device->tgt_report);
+        ReleaseSRWLockExclusive(&vigem_lock);
     }
 }
 
@@ -564,8 +623,7 @@ static void mi_gamepad_stop_cb(int gamepad_id, BYTE break_reason)
     }
     if (remove_device(gamepad_id))
     {
-        rebuild_tray_menu();
-        tray_update(&tray);
+        refresh_tray(NULL);
         if (!(reattaching && break_reason == MI_BREAK_REASON_REQUESTED))
         {
             tray_show_notification(ntf_type, TEXT("Remove device"), ntf_text);
@@ -584,9 +642,7 @@ static void CALLBACK x360_notification_cb(PVIGEM_CLIENT client, PVIGEM_TARGET ta
         debug_log("gamepad %d: xinput slot %d", active_device->src_gamepad_id, (int)led_number);
         if (active_device->tray_menu != NULL)
         {
-            update_tray_text(active_device);
-            rebuild_tray_menu();
-            tray_update(&tray);
+            refresh_tray(active_device);
         }
     }
     mi_gamepad_set_vibration(active_device->src_gamepad_id, small_motor, large_motor);
@@ -630,8 +686,7 @@ static void autostart_cb(struct tray_menu *item)
         tray_show_notification(NT_TRAY_ERROR, TEXT("Autostart at Logon"),
                                TEXT("Could not change the autostart setting."));
     }
-    rebuild_tray_menu();
-    tray_update(&tray);
+    refresh_tray(NULL);
 }
 
 static void github_cb(struct tray_menu *item)
@@ -718,6 +773,9 @@ int main(int argc, char **argv)
     CloseHandle(refresh_thread);
     CloseHandle(refresh_event);
 
+    PVIGEM_TARGET exit_targets[MAX_ACTIVE_DEVICE_COUNT];
+    BOOLEAN exit_added[MAX_ACTIVE_DEVICE_COUNT];
+    int exit_count = 0;
     AcquireSRWLockExclusive(&active_devices_lock);
     for (int i = 0; i < active_device_count; i++)
     {
@@ -727,23 +785,26 @@ int main(int argc, char **argv)
         }
         hid_close_device(active_devices[i]->src_device);
         hid_free_device(active_devices[i]->src_device);
-        if (vigem_connected)
-        {
-            vigem_target_x360_unregister_notification(active_devices[i]->tgt_device);
-            vigem_target_remove(vigem_client, active_devices[i]->tgt_device);
-            vigem_target_free(active_devices[i]->tgt_device);
-        }
+        exit_targets[exit_count] = active_devices[i]->tgt_device;
+        exit_added[exit_count] = active_devices[i]->tgt_added;
+        exit_count++;
         free(active_devices[i]->tray_menu);
         free(active_devices[i]->tray_text);
         free(active_devices[i]);
     }
     active_device_count = 0;
     ReleaseSRWLockExclusive(&active_devices_lock);
+    for (int i = 0; i < exit_count; i++)
+    {
+        vigem_release_target(exit_targets[i], exit_added[i]);
+    }
+    AcquireSRWLockExclusive(&vigem_lock);
     if (vigem_connected)
     {
         vigem_disconnect(vigem_client);
     }
     vigem_free(vigem_client);
+    ReleaseSRWLockExclusive(&vigem_lock);
     if (hid_hide_connected)
     {
         hid_hide_free();

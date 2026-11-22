@@ -160,8 +160,13 @@ static struct hh_str_arr* _hh_get_black_list(HANDLE dev_handle)
         return NULL;
     }
     LPWSTR output_buffer = (LPWSTR)malloc(bytes_returned);
+    if (output_buffer == NULL)
+    {
+        return NULL;
+    }
     if (!DeviceIoControl(dev_handle, IOCTL_GET_BLACKLIST, NULL, 0, output_buffer, bytes_returned, &bytes_returned, NULL))
     {
+        free(output_buffer);
         return NULL;
     }
     struct hh_str_arr* arr = _hh_multi_string_to_arr(output_buffer, bytes_returned / sizeof(WCHAR));
@@ -186,8 +191,13 @@ static struct hh_str_arr* _hh_get_white_list(HANDLE dev_handle)
         return NULL;
     }
     LPWSTR output_buffer = (LPWSTR)malloc(bytes_returned);
+    if (output_buffer == NULL)
+    {
+        return NULL;
+    }
     if (!DeviceIoControl(dev_handle, IOCTL_GET_WHITELIST, NULL, 0, output_buffer, bytes_returned, &bytes_returned, NULL))
     {
+        free(output_buffer);
         return NULL;
     }
     struct hh_str_arr* arr = _hh_multi_string_to_arr(output_buffer, bytes_returned / sizeof(WCHAR));
@@ -267,11 +277,14 @@ static LPTSTR _hh_get_app_image_name()
         }
         FindVolumeClose(fv_handle);
     }
-    if (mount_point != NULL && GetVolumeNameForVolumeMountPointW(mount_point, volume_name, UNICODE_STRING_MAX_CHARS))
+    if (mount_point != NULL && GetVolumeNameForVolumeMountPointW(mount_point, volume_name, UNICODE_STRING_MAX_CHARS)
+        && wcslen(volume_name) > 5)
     {
         WCHAR dos_device_name[UNICODE_STRING_MAX_CHARS], stripped_volume_name[UNICODE_STRING_MAX_CHARS];
         // Strip the leading '\\?\' and trailing '\' and isolate the Volume{} part in the volume name
-        wcsncpy(stripped_volume_name, volume_name + 4, wcslen(volume_name) - 5);
+        size_t stripped_len = wcslen(volume_name) - 5;
+        wcsncpy(stripped_volume_name, volume_name + 4, stripped_len);
+        stripped_volume_name[stripped_len] = L'\0';
         if (QueryDosDeviceW(stripped_volume_name, dos_device_name, UNICODE_STRING_MAX_CHARS))
         {
             WCHAR filename_wo_mount_point[UNICODE_STRING_MAX_CHARS];
@@ -317,6 +330,16 @@ int hid_hide_init()
 
     // check if our app whitelisted
     LPTSTR app_image_name = _hh_get_app_image_name();
+    if (app_image_name == NULL)
+    {
+        // without our own image name we cannot whitelist ourselves, and hiding would lock us out of the pads
+        _hh_free_str_arr(hh_ctx->black_list);
+        _hh_free_str_arr(hh_ctx->white_list);
+        CloseHandle(handle);
+        free(hh_ctx);
+        hh_ctx = NULL;
+        return HID_HIDE_INIT_ERROR;
+    }
     BOOLEAN app_whitelisted = _hh_in_str_arr(hh_ctx->white_list, app_image_name);
     if (!hh_ctx->inverse && !app_whitelisted)
     {

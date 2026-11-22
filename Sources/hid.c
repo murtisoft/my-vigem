@@ -58,8 +58,11 @@ static void _hid_fill_symlink_and_desc(struct hid_device_info *dev_info)
             {
                 desc_buffer = NULL;
 
-                if (SetupDiGetDevicePropertyW(device_info_set, &devinfo_data, &DEVPKEY_Device_BusReportedDeviceDesc,
-                                              &prop_type, NULL, 0, &required_size, 0))
+                // the size query always fails with ERROR_INSUFFICIENT_BUFFER and reports the size
+                required_size = 0;
+                if (!SetupDiGetDevicePropertyW(device_info_set, &devinfo_data, &DEVPKEY_Device_BusReportedDeviceDesc,
+                                               &prop_type, NULL, 0, &required_size, 0)
+                    && GetLastError() == ERROR_INSUFFICIENT_BUFFER && required_size > 0)
                 {
                     desc_buffer_w = (LPWSTR)calloc(1, required_size);
                     SetupDiGetDevicePropertyW(device_info_set, &devinfo_data, &DEVPKEY_Device_BusReportedDeviceDesc,
@@ -621,24 +624,30 @@ INT hid_send_output_report(struct hid_device *device, const void *data, size_t l
 {
     DWORD bytes_written;
     OVERLAPPED ol = { 0 };
+    // own event: waiting on the file handle would also wake for the pending read of the input thread
+    ol.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (ol.hEvent == NULL)
+    {
+        return -1;
+    }
 
     _mem_zero(device->output_buffer, device->output_report_size);
     _mem_copy(device->output_buffer, data, length > device->output_report_size ? device->output_report_size : length);
 
+    INT result = -1;
+    BOOLEAN started = TRUE;
     if (!WriteFile(device->handle, device->output_buffer, device->output_report_size, &bytes_written, &ol))
     {
-        if (GetLastError() != ERROR_IO_PENDING)
-        {
-            return -1;
-        }
+        started = (GetLastError() == ERROR_IO_PENDING);
     }
 
-    if (GetOverlappedResult(device->handle, &ol, &bytes_written, TRUE))
+    if (started && GetOverlappedResult(device->handle, &ol, &bytes_written, TRUE))
     {
-        return bytes_written;
+        result = bytes_written;
     }
 
-    return -1;
+    CloseHandle(ol.hEvent);
+    return result;
 }
 
 BOOLEAN hid_probe_feature(struct hid_device *device, const void *data, size_t length)

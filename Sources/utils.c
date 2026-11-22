@@ -4,10 +4,17 @@
 #include <stdio.h>
 #include <string.h>
 #include <tchar.h>
+#include <wctype.h>
 #include <windows.h>
 
 #include "utils.h"
 #include "debug_win.h"
+
+#ifdef UNICODE
+#define _TCS_LOWER(c) ((TCHAR)towlower((wint_t)(c)))
+#else
+#define _TCS_LOWER(c) ((TCHAR)tolower((unsigned char)(c)))
+#endif
 
 PTCHAR _tcsistr(PTCHAR haystack, const PTCHAR needle)
 {
@@ -15,7 +22,7 @@ PTCHAR _tcsistr(PTCHAR haystack, const PTCHAR needle)
     {
         PTCHAR h = haystack;
         PTCHAR n = needle;
-        while (tolower((TBYTE)*h) == tolower((TBYTE)*n) && *n)
+        while (_TCS_LOWER(*h) == _TCS_LOWER(*n) && *n)
         {
             h++;
             n++;
