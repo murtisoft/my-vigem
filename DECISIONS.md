@@ -22,16 +22,17 @@ Durable project choices, deduced from the code. Follow them; fix a line when a s
 ## Concurrency
 - Per gamepad (`mi.c`): one input thread, one output (vibration) thread, one delay thread, stopped via `stopping_event`; input thread cleans everything up and calls `stop_cb` last.
 - `active_devices` is guarded by an SRW lock; removals signal a condition variable.
-- Device refreshes run on a single worker thread; the tray thread only sets an event. Requests are coalesced; a full refresh wins over a normal one.
+- Device refreshes run on a single worker thread; the tray thread only sets an event. Requests are coalesced; a reset (`Reset Gamepads`) wins over a normal refresh.
 - Tray UI calls come from the worker/input threads directly (`tray_update`, notifications).
 
 ## Behavior (fork features)
 - Single instance via named mutex `MI-VIGEM`; a second instance exits silently.
 - Device arrival/removal (any HID interface change) triggers a normal refresh, whatever the operation type.
-- Refresh menu item = full refresh: stop all pads, wait up to 5 s for removal, re-add in the same order, restart numbering at #1, then a normal refresh. Routine notifications are suppressed while `reattaching`.
+- `Reset Gamepads` menu item = `reset_devices`: stop all pads, wait up to 5 s for removal, restart numbering at #1, turn every real pad off by disabling and re-enabling its PARENT devnode (the "Bluetooth HID Device", not the HID-compliant game controller child). Nothing is re-added; pads come back via the normal refresh when switched on. Routine notifications are suppressed while `reattaching`.
 - Opening a device: exclusive RW first; on failure disable+enable the devnode and retry exclusive, then shared; if re-enable fails, shared open directly.
-- Disabled devnodes of the gamepad are re-enabled at every refresh (`hid_enable_disabled_devices`), so a failed re-enable never leaves it disabled.
+- Disabled HID devnodes of the gamepad (`HID\...`, the virtual-side children that got stuck) are re-enabled at every refresh (`hid_enable_disabled_devices`); the parent (`BTHENUM\...`) is never touched there, so a reset or a manual disable of it stays.
 - Re-enable: disable, wait for state, then enable with up to 3 attempts and a `CM_Enable_DevNode` fallback; each state change waits up to 10 s (20 ms poll).
+- Win11 keeps the HID devnode and the pending read after the pad powers off (Win10 failed the read), so the input thread probes with a feature report `0x20` (current motor values, private buffer) after 300 silent 1 s read timeouts (the pad's idle shutdown is 300 s; earlier probing might keep it awake); a failed probe ends the pad (write error).
 - Rumble retries a failed command every 50 ms until it works (no timed safety stop); on stop, vibration-off is retried up to 20 times.
 - If ViGEmBus is missing/incompatible the app still runs and lists devices, with an error/warning notification.
 
@@ -42,7 +43,7 @@ Durable project choices, deduced from the code. Follow them; fix a line when a s
 - On exit: restore HidHide's initial active state; the blacklist/whitelist entries we added are not otherwise restored besides per-device unbind.
 
 ## UI
-- Tray icon only: menu lists `#N Xiaomi Gamepad (batt. X%)` items (N = XInput slot + 1, clicking one vibrates that pad for 500 ms), a separator, `Refresh`, (`Debug`, debug builds only), a separator, `Autostart at Logon` (checked), `GitHub Page`, a separator, `Quit  (ver. x.y.z)`.
+- Tray icon only: menu lists `#N Xiaomi Gamepad (batt. X%)` items (N = XInput slot + 1, taken from the X360 LED number in the ViGEm notification because the slot is assigned after the target is added; until then our own running index, clicking one vibrates that pad for 500 ms), a separator, `Reset Gamepads`, (`Debug`, debug builds only), a separator, `Autostart at Logon` (checked), `GitHub Page`, a separator, `Quit  (ver. x.y.z)`.
 - Autostart = HKCU `...\Run` value `My-ViGEm` holding the quoted exe path (`autostart.c`); enabled only if the stored path equals the running exe. State is cached in `autostart_checked`.
 - Menu is rebuilt from `active_devices` (`rebuild_tray_menu`) then applied with `tray_update`.
 - Notifications are balloon tips (10 s), levels info/warning/error.

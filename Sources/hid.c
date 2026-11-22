@@ -310,36 +310,58 @@ static BOOLEAN _hid_change_state(HDEVINFO set, SP_DEVINFO_DATA *data, DWORD stat
     return TRUE;
 }
 
-BOOLEAN hid_reenable_device(struct hid_device_info *device_info)
+// Disables and enables a devnode. hid_interface: the devnode is a HID interface device (found via the HID
+// interface GUID); otherwise any present devnode with that instance id (e.g. the parent of a HID device).
+static BOOLEAN _hid_toggle_devnode(LPCTSTR instance_path, BOOLEAN hid_interface)
 {
     GUID interface_guid = hid_get_interface_guid();
     SP_DEVINFO_DATA devinfo_data;
     HDEVINFO device_info_set = INVALID_HANDLE_VALUE;
 
-    debug_log("hid_reenable_device: " DBG_TSTR, device_info->instance_path);
+    debug_log("hid_reenable_device: " DBG_TSTR, instance_path);
 
     devinfo_data = (SP_DEVINFO_DATA){ 0 };
     devinfo_data.cbSize = sizeof(SP_DEVINFO_DATA);
 
-    device_info_set = SetupDiGetClassDevs(&interface_guid, device_info->instance_path, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-    if (device_info_set == INVALID_HANDLE_VALUE)
+    if (hid_interface)
     {
-        debug_log("  SetupDiGetClassDevs failed, error=%lu", GetLastError());
-        return FALSE;
-    }
+        device_info_set = SetupDiGetClassDevs(&interface_guid, instance_path, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+        if (device_info_set == INVALID_HANDLE_VALUE)
+        {
+            debug_log("  SetupDiGetClassDevs failed, error=%lu", GetLastError());
+            return FALSE;
+        }
 
-    if (!SetupDiEnumDeviceInfo(device_info_set, 0, &devinfo_data))
-    {
-        debug_log("  SetupDiEnumDeviceInfo(0) failed, error=%lu", GetLastError());
-        SetupDiDestroyDeviceInfoList(device_info_set);
-        return FALSE;
+        if (!SetupDiEnumDeviceInfo(device_info_set, 0, &devinfo_data))
+        {
+            debug_log("  SetupDiEnumDeviceInfo(0) failed, error=%lu", GetLastError());
+            SetupDiDestroyDeviceInfoList(device_info_set);
+            return FALSE;
+        }
+        SP_DEVINFO_DATA extra = { .cbSize = sizeof(SP_DEVINFO_DATA) };
+        if (SetupDiEnumDeviceInfo(device_info_set, 1, &extra))
+        {
+            debug_log("  more than one device matched the instance path, aborting");
+            SetupDiDestroyDeviceInfoList(device_info_set);
+            return FALSE;
+        }
     }
-    SP_DEVINFO_DATA extra = { .cbSize = sizeof(SP_DEVINFO_DATA) };
-    if (SetupDiEnumDeviceInfo(device_info_set, 1, &extra))
+    else
     {
-        debug_log("  more than one device matched the instance path, aborting");
-        SetupDiDestroyDeviceInfoList(device_info_set);
-        return FALSE;
+        // SetupDiGetClassDevs accepts an instance id as enumerator only together with DIGCF_DEVICEINTERFACE,
+        // which a parent devnode (BTHENUM\...) has no interface for: open the devnode by its id instead
+        device_info_set = SetupDiCreateDeviceInfoList(NULL, NULL);
+        if (device_info_set == INVALID_HANDLE_VALUE)
+        {
+            debug_log("  SetupDiCreateDeviceInfoList failed, error=%lu", GetLastError());
+            return FALSE;
+        }
+        if (!SetupDiOpenDeviceInfo(device_info_set, instance_path, NULL, 0, &devinfo_data))
+        {
+            debug_log("  SetupDiOpenDeviceInfo failed, error=%lu", GetLastError());
+            SetupDiDestroyDeviceInfoList(device_info_set);
+            return FALSE;
+        }
     }
 
     BOOLEAN res = _hid_change_state(device_info_set, &devinfo_data, DICS_DISABLE);
@@ -371,8 +393,25 @@ BOOLEAN hid_reenable_device(struct hid_device_info *device_info)
     return res;
 }
 
+BOOLEAN hid_reenable_device(struct hid_device_info *device_info)
+{
+    return _hid_toggle_devnode(device_info->instance_path, TRUE);
+}
+
+BOOLEAN hid_power_off_device(struct hid_device_info *device_info)
+{
+    if (device_info->container_instance_path == NULL)
+    {
+        debug_log("hid_power_off_device: no parent devnode for " DBG_TSTR, device_info->instance_path);
+        return FALSE;
+    }
+    debug_log("hid_power_off_device: parent " DBG_TSTR, device_info->container_instance_path);
+    return _hid_toggle_devnode(device_info->container_instance_path, FALSE);
+}
+
 // Enumeration skips disabled devices (their interface is gone), so a device left disabled by an
 // earlier failed re-enable is never seen again. Find such devnodes and enable them.
+// Only the HID devnodes (HID\\...) are handled: the parent (BTHENUM\\...) is turned off on purpose by the reset.
 void hid_enable_disabled_devices(const LPTSTR *path_filters)
 {
     LPTSTR class_filter = _guid_to_str(&GUID_DEVCLASS_HIDCLASS);
@@ -400,7 +439,7 @@ void hid_enable_disabled_devices(const LPTSTR *path_filters)
             }
             DEVINST devinst;
             ULONG status = 0, problem = 0;
-            if (i > start && matched && CM_Locate_DevNode(&devinst, id, CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS &&
+            if (i > start && matched && _tcsnicmp(id, TEXT("HID\\"), 4) == 0 && CM_Locate_DevNode(&devinst, id, CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS &&
                 CM_Get_DevNode_Status(&status, &problem, devinst, 0) == CR_SUCCESS &&
                 (status & DN_HAS_PROBLEM) && problem == CM_PROB_DISABLED)
             {
@@ -600,6 +639,18 @@ INT hid_send_output_report(struct hid_device *device, const void *data, size_t l
     }
 
     return -1;
+}
+
+BOOLEAN hid_probe_feature(struct hid_device *device, const void *data, size_t length)
+{
+    BYTE buf[256];
+    if (device->feature_report_size == 0 || device->feature_report_size > sizeof(buf))
+    {
+        return TRUE; // cannot probe, assume alive
+    }
+    _mem_zero(buf, device->feature_report_size);
+    _mem_copy(buf, data, length < device->feature_report_size ? length : device->feature_report_size);
+    return HidD_SetFeature(device->handle, buf, device->feature_report_size) ? TRUE : FALSE;
 }
 
 INT hid_send_feature_report(struct hid_device *device, const void *data, size_t length)

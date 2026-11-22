@@ -1,15 +1,10 @@
 # DONE
 
-## 5. Tray menu basics
-- [x] 5.1. Pass CMake version into code (`APP_VERSION_STR` from `PROJECT_VERSION`); Quit text is `Quit  (ver. x.y.z)`
-- [x] 5.2. Debug item only in debug builds (`MY_VIGEM_DEBUG`, defined for the CMake Debug config)
-- [x] 5.3. `GitHub Page` item above `Quit` (`ShellExecute`)
-- [x] 5.4.1. `autostart.c/h`: HKCU `Run` key helpers
-- [x] 5.4.2. `Autostart at Logon` item, checkmark cached in `autostart_checked`, click toggles
-- [x] 5.5. Separator before `Quit`; menu order finalized
+## 7. Reset Gamepads
+- [x] 7.1. Renamed `Refresh` to `Reset Gamepads` (menu text, logs, `DECISIONS.md`)
+- [x] 7.2.1. `hid_power_off_device`: turns a pad off via disable + re-enable of the parent devnode of its HID device (shares `_hid_toggle_devnode` with `hid_reenable_device`)
+- [x] 7.2.2. `reset_devices` (replaces `reattach_devices`): stop and clear all pads, turn each real pad off via `hid_power_off_device` (once per parent), do not re-add
+- [x] 7.3. `DECISIONS.md` updated (Reset behavior, Autostart method, version define); `MAP.md` was not in the uploaded zip, so it was not touched
 
-## 6. Gamepad entries
-- [x] 6.1.1. Read the XInput slot of each ViGEm pad after it is added (`vigem_target_x360_get_user_index`), stored in `active_device.xinput_slot` (-1 if unknown)
-- [x] 6.1.2. Menu entry number = XInput slot + 1 (falls back to the running index)
-- [x] 6.2.1. `mi_gamepad_identify`: 500 ms full rumble pulse on its own short thread
-- [x] 6.2.2. Pad menu entries call `mi_gamepad_identify` (context = gamepad id)
+## 8. Idle disconnect
+- [x] 8.1. Win11 does not remove the virtual pad when the real one powers off (read never fails); input thread now probes the pad (`hid_probe_feature`) after 300 silent read timeouts and stops the pad if the probe fails

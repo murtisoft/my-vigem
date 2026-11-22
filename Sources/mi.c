@@ -10,6 +10,10 @@
 #pragma comment(lib, "kernel32.lib")
 
 #define MI_READ_TIMEOUT 1000
+// Win11 keeps the HID devnode (and a pending read) after the pad powers off, so an idle read never fails.
+// The pad powers off after 300 s idle, so only after this many silent read timeouts (1 s each) in a row
+// probe it with a harmless feature report (probing earlier could keep the pad awake).
+#define MI_PROBE_AFTER_TIMEOUTS 300
 #define MI_VIBRATION_RETRY_DELAY 50
 #define MI_VIBRATION_OFF_RETRIES 20
 
@@ -81,9 +85,31 @@ static DWORD WINAPI _mi_input_thread_proc(LPVOID lparam)
 
     while (TRUE)
     {
+        int silent_timeouts = 0;
+        BOOLEAN probe_failed = FALSE;
         while (gp->active && (bytes_read = hid_get_input_report(gp->device, MI_READ_TIMEOUT)) == 0)
         {
-            ;
+            if (++silent_timeouts >= MI_PROBE_AFTER_TIMEOUTS)
+            {
+                BYTE probe[3];
+                probe[MI_VIBRATION_HEADER] = init_vibration[MI_VIBRATION_HEADER];
+                AcquireSRWLockShared(&gp->vibr_lock);
+                probe[MI_VIBRATION_SMALL_MOTOR] = gp->small_motor;
+                probe[MI_VIBRATION_BIG_MOTOR] = gp->big_motor;
+                ReleaseSRWLockShared(&gp->vibr_lock);
+                if (!hid_probe_feature(gp->device, probe, sizeof(probe)))
+                {
+                    probe_failed = TRUE;
+                    debug_log("gamepad %d probe failed, pad is gone", gp->id);
+                    break;
+                }
+            }
+        }
+
+        if (probe_failed)
+        {
+            break_reason = MI_BREAK_REASON_WRITE_ERROR;
+            break;
         }
 
         if (!gp->active || bytes_read < 0)

@@ -73,7 +73,7 @@ static void autostart_cb(struct tray_menu *item);
 static void github_cb(struct tray_menu *item);
 static void quit_cb(struct tray_menu *item);
 
-static const struct tray_menu tray_menu_refresh = { .text = TEXT("Refresh"), .cb = refresh_cb };
+static const struct tray_menu tray_menu_refresh = { .text = TEXT("Reset Gamepads"), .cb = refresh_cb };
 #ifdef MY_VIGEM_DEBUG
 static const struct tray_menu tray_menu_debug = { .text = TEXT("Debug"), .cb = debug_cb };
 #endif
@@ -103,6 +103,38 @@ SHORT FORCEINLINE _map_byte_to_short(BYTE value, BOOLEAN inverted)
         centered = -centered;
     }
     return (SHORT)(32767 * centered / 127);
+}
+
+static SRWLOCK tray_text_lock = SRWLOCK_INIT;
+
+// Rebuilds the menu text of a pad from its current number and battery level.
+static void update_tray_text(struct active_device *active_device)
+{
+    TCHAR battery_buffer[8];
+    if (active_device->src_battery_level < 0)
+    {
+        _tcscpy(battery_buffer, BATTERY_NA_TEXT);
+    }
+    else
+    {
+        _stprintf(battery_buffer, TEXT("%d%%"), active_device->src_battery_level);
+    }
+    int tray_text_length = _sctprintf(ACTIVE_DEVICE_MENU_TEMPLATE, _device_number(active_device), battery_buffer);
+    LPTSTR text = (LPTSTR)malloc((tray_text_length + 1) * sizeof(TCHAR));
+    if (text == NULL)
+    {
+        return;
+    }
+    _stprintf(text, ACTIVE_DEVICE_MENU_TEMPLATE, _device_number(active_device), battery_buffer);
+    AcquireSRWLockExclusive(&tray_text_lock);
+    LPTSTR prev_text = active_device->tray_text;
+    active_device->tray_text = text;
+    if (active_device->tray_menu != NULL)
+    {
+        active_device->tray_menu->text = text;
+    }
+    ReleaseSRWLockExclusive(&tray_text_lock);
+    free(prev_text);
 }
 
 static void rebuild_tray_menu()
@@ -198,18 +230,13 @@ static BOOLEAN add_device(struct hid_device_info *device_info)
     active_device->index = ++last_active_device_index;
     active_device->src_gamepad_id = mi_gamepad_id;
     active_device->src_battery_level = -1;
-    active_device->xinput_slot = -1;
+    active_device->xinput_slot = -1; // learned from the LED notification, the slot is assigned later
+    active_device->tray_text = NULL;
+    active_device->tray_menu = NULL;
     if (vigem_connected)
     {
         active_device->tgt_device = vigem_target_x360_alloc();
         vigem_target_add(vigem_client, active_device->tgt_device);
-        ULONG user_index = 0;
-        if (VIGEM_SUCCESS(vigem_target_x360_get_user_index(vigem_client, active_device->tgt_device, &user_index)))
-        {
-            active_device->xinput_slot = (int)user_index;
-        }
-        debug_log("gamepad %d: xinput slot %d", mi_gamepad_id, active_device->xinput_slot);
-        XUSB_REPORT_INIT(&active_device->tgt_report);
         vigem_target_x360_register_notification(vigem_client, active_device->tgt_device, x360_notification_cb,
                                                 (LPVOID)active_device);
     }
@@ -346,22 +373,19 @@ static void refresh_devices()
     }
 }
 
-// Removes all virtual pads and attaches them again, keeping their order.
-static void reattach_devices()
+// Removes all virtual pads and turns the real pads off (disables and re-enables their parent devnode).
+// Nothing is added back: the pads come back through the normal refresh when they are switched on again.
+static void reset_devices()
 {
-    LPTSTR saved[MAX_ACTIVE_DEVICE_COUNT];
-    int saved_count = 0;
-
     InterlockedExchange(&reattaching, 1);
 
-    // remember the current order and ask every gamepad to stop
+    // find the real pads first (also ones that are not active), they are gone from the list after stopping
+    LPTSTR mi_hw_path_filters[3] = { MI_HW_FILTER_WIN10, MI_HW_FILTER_WIN7, NULL };
+    struct hid_device_info *device_info = hid_enumerate(mi_hw_path_filters);
+
     AcquireSRWLockShared(&active_devices_lock);
     for (int i = 0; i < active_device_count; i++)
     {
-        LPTSTR symlink = active_devices[i]->src_device->device_info->symlink;
-        saved[saved_count] = (LPTSTR)malloc((_tcslen(symlink) + 1) * sizeof(TCHAR));
-        _tcscpy(saved[saved_count], symlink);
-        saved_count++;
         mi_gamepad_stop(active_devices[i]->src_gamepad_id);
     }
     ReleaseSRWLockShared(&active_devices_lock);
@@ -380,36 +404,31 @@ static void reattach_devices()
         }
     }
     ReleaseSRWLockShared(&active_devices_lock);
-
-    // add them back in the remembered order, so the numbering stays the same
     last_active_device_index = 0;
-    if (saved_count > 0)
+
+    // turn the real pads off, once per parent devnode (a pad can expose several HID interfaces)
+    for (struct hid_device_info *cur = device_info; cur != NULL; cur = cur->next)
     {
-        LPTSTR mi_hw_path_filters[3] = { MI_HW_FILTER_WIN10, MI_HW_FILTER_WIN7, NULL };
-        struct hid_device_info *device_info = hid_enumerate(mi_hw_path_filters);
-        for (int i = 0; i < saved_count; i++)
+        BOOLEAN done = FALSE;
+        for (struct hid_device_info *prev = device_info; prev != cur && !done; prev = prev->next)
         {
-            for (struct hid_device_info *cur = device_info; cur != NULL; cur = cur->next)
-            {
-                if (_tcscmp(saved[i], cur->symlink) == 0)
-                {
-                    add_device(cur);
-                    break;
-                }
-            }
-            free(saved[i]);
+            done = cur->container_instance_path != NULL && prev->container_instance_path != NULL &&
+                   _tcsicmp(cur->container_instance_path, prev->container_instance_path) == 0;
         }
-        while (device_info)
+        if (!done)
         {
-            struct hid_device_info *next = device_info->next;
-            hid_free_device_info(device_info);
-            device_info = next;
+            hid_power_off_device(cur);
         }
     }
+    while (device_info)
+    {
+        struct hid_device_info *next = device_info->next;
+        hid_free_device_info(device_info);
+        device_info = next;
+    }
 
-    // pick up anything that was not active before
-    refresh_devices();
     InterlockedExchange(&reattaching, 0);
+    debug_log("reset done, waiting for new connections");
 }
 
 // Device refreshes (enumeration, re-enabling, opening) can block for seconds, so they run on a
@@ -431,7 +450,7 @@ static DWORD WINAPI refresh_thread_proc(LPVOID param)
         }
         if (InterlockedExchange(&refresh_full, 0))
         {
-            reattach_devices();
+            reset_devices();
         }
         else
         {
@@ -487,13 +506,7 @@ static void mi_gamepad_update_cb(int gamepad_id, struct mi_state *state)
     if (active_device->src_battery_level != state->battery)
     {
         active_device->src_battery_level = state->battery;
-        TCHAR battery_buffer[5];
-        _stprintf(battery_buffer, TEXT("%d%%"), active_device->src_battery_level);
-        int tray_text_length = _sctprintf(ACTIVE_DEVICE_MENU_TEMPLATE, _device_number(active_device), battery_buffer);
-        free(active_device->tray_text);
-        active_device->tray_text = (LPTSTR)malloc((tray_text_length + 1) * sizeof(TCHAR));
-        _stprintf(active_device->tray_text, ACTIVE_DEVICE_MENU_TEMPLATE, _device_number(active_device), battery_buffer);
-        active_device->tray_menu->text = active_device->tray_text;
+        update_tray_text(active_device);
         rebuild_tray_menu();
         tray_update(&tray);
     }
@@ -564,6 +577,18 @@ static void CALLBACK x360_notification_cb(PVIGEM_CLIENT client, PVIGEM_TARGET ta
                                           UCHAR small_motor, UCHAR led_number, LPVOID user_data)
 {
     struct active_device *active_device = (struct active_device *)user_data;
+    // the LED number is the XInput slot (0..3); it arrives once Windows has assigned the slot
+    if (led_number <= 3 && active_device->xinput_slot != (int)led_number)
+    {
+        active_device->xinput_slot = (int)led_number;
+        debug_log("gamepad %d: xinput slot %d", active_device->src_gamepad_id, (int)led_number);
+        if (active_device->tray_menu != NULL)
+        {
+            update_tray_text(active_device);
+            rebuild_tray_menu();
+            tray_update(&tray);
+        }
+    }
     mi_gamepad_set_vibration(active_device->src_gamepad_id, small_motor, large_motor);
 }
 
@@ -575,8 +600,8 @@ static void pad_menu_cb(struct tray_menu *item)
 static void refresh_cb(struct tray_menu *item)
 {
     (void)item;
-    printf("Refresh\n");
-    debug_log("Refresh requested");
+    printf("Reset Gamepads\n");
+    debug_log("Reset Gamepads requested");
     fflush(stdout);
     request_full_refresh();
 }
