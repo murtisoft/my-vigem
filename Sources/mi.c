@@ -14,6 +14,9 @@
 // The pad powers off after 300 s idle, so only after this many silent read timeouts (1 s each) in a row
 // probe it with a harmless feature report (probing earlier could keep the pad awake).
 #define MI_PROBE_AFTER_TIMEOUTS 300
+// A manual power-off (Mi button held) sends one last blank (all neutral) report and then goes silent. So when
+// the last report was blank, probe once after this many silent read timeouts (1 s each).
+#define MI_PROBE_AFTER_BLANK_TIMEOUTS 2
 #define MI_VIBRATION_RETRY_DELAY 50
 #define MI_VIBRATION_OFF_RETRIES 20
 
@@ -82,6 +85,7 @@ static DWORD WINAPI _mi_input_thread_proc(LPVOID lparam)
     struct mi_gamepad *gp = (struct mi_gamepad *)lparam;
     INT bytes_read = 0;
     BYTE break_reason = MI_BREAK_REASON_UNKNOWN;
+    BOOLEAN last_blank = FALSE;
 
     while (TRUE)
     {
@@ -89,7 +93,9 @@ static DWORD WINAPI _mi_input_thread_proc(LPVOID lparam)
         BOOLEAN probe_failed = FALSE;
         while (gp->active && (bytes_read = hid_get_input_report(gp->device, MI_READ_TIMEOUT)) == 0)
         {
-            if (++silent_timeouts >= MI_PROBE_AFTER_TIMEOUTS)
+            ++silent_timeouts;
+            if (silent_timeouts >= MI_PROBE_AFTER_TIMEOUTS
+                || (last_blank && silent_timeouts == MI_PROBE_AFTER_BLANK_TIMEOUTS))
             {
                 BYTE probe[3];
                 probe[MI_VIBRATION_HEADER] = init_vibration[MI_VIBRATION_HEADER];
@@ -128,6 +134,14 @@ static DWORD WINAPI _mi_input_thread_proc(LPVOID lparam)
         if (gp->device->input_buffer[0] != 0x04)
         {
             continue;
+        }
+
+        // blank report: no buttons, centered sticks and d-pad, no triggers, no Mi button (accel and battery ignored)
+        {
+            const BYTE *b = gp->device->input_buffer;
+            last_blank = b[1] == 0 && b[2] == 0 && b[4] == 0x0F
+                && b[5] == 0x80 && b[6] == 0x80 && b[7] == 0x80 && b[8] == 0x80
+                && b[11] == 0 && b[12] == 0 && b[20] == 0;
         }
 
         AcquireSRWLockExclusive(&gp->state_lock);
