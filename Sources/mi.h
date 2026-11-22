@@ -53,6 +53,11 @@ struct mi_state
     BYTE battery;
 };
 
+typedef void (*mi_raw_cb_t)(int gamepad_id, const BYTE *report, DWORD size);
+
+// Debug hook: receives every raw input report (any header) on the gamepad's input thread. NULL disables it.
+void mi_set_raw_cb(mi_raw_cb_t cb);
+
 int mi_gamepad_start(struct hid_device *device, void (*upd_cb)(int, struct mi_state *), void (*stop_cb)(int, BYTE));
 void mi_gamepad_set_vibration(int gamepad_id, BYTE small_motor, BYTE big_motor);
 void mi_gamepad_stop(int gamepad_id);

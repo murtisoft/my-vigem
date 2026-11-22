@@ -2,10 +2,12 @@
 #include <stddef.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <string.h>
 #include <tchar.h>
 #include <windows.h>
 
 #include "utils.h"
+#include "debug_win.h"
 
 PTCHAR _tcsistr(PTCHAR haystack, const PTCHAR needle)
 {
@@ -97,11 +99,21 @@ void debug_log(const char *fmt, ...)
 {
     SYSTEMTIME st;
     GetLocalTime(&st);
-    printf("[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    char line[1024];
+    int prefix = snprintf(line, sizeof(line), "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
     va_list args;
     va_start(args, fmt);
-    vprintf(fmt, args);
+    vsnprintf(line + prefix, sizeof(line) - prefix, fmt, args);
     va_end(args);
-    printf("\n");
+    printf("%s\n", line);
     fflush(stdout);
+
+    // mirror the line into the debug window log
+    TCHAR wide[1024];
+#ifdef UNICODE
+    MultiByteToWideChar(CP_ACP, 0, line, -1, wide, 1024);
+#else
+    strcpy(wide, line);
+#endif
+    debug_win_append(wide);
 }

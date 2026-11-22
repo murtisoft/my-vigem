@@ -4,6 +4,7 @@
 
 #include "mi.h"
 #include "hid.h"
+#include "utils.h"
 
 #pragma comment(lib, "kernel32.lib")
 
@@ -64,6 +65,13 @@ static int last_gamepad_id = 0;
 static struct mi_gamepad *root_gp = NULL;
 static SRWLOCK gp_lock = SRWLOCK_INIT;
 
+static volatile mi_raw_cb_t raw_cb = NULL;
+
+void mi_set_raw_cb(mi_raw_cb_t cb)
+{
+    raw_cb = cb;
+}
+
 static DWORD WINAPI _mi_input_thread_proc(LPVOID lparam)
 {
     struct mi_gamepad *gp = (struct mi_gamepad *)lparam;
@@ -81,6 +89,12 @@ static DWORD WINAPI _mi_input_thread_proc(LPVOID lparam)
         {
             break_reason = !gp->active ? MI_BREAK_REASON_REQUESTED : MI_BREAK_REASON_READ_ERROR;
             break;
+        }
+
+        mi_raw_cb_t raw = raw_cb;
+        if (raw != NULL)
+        {
+            raw(gp->id, gp->device->input_buffer, (DWORD)bytes_read);
         }
 
         // check packet header
@@ -171,6 +185,7 @@ static DWORD WINAPI _mi_output_thread_proc(LPVOID lparam)
 
     HANDLE wait_events[2] = { gp->stopping_event, gp->out_event };
     DWORD timeout = INFINITE;
+    BOOLEAN fail_logged = FALSE;
     // last successfully sent vibration state
     BYTE vibration[3];
     vibration[MI_VIBRATION_HEADER] = init_vibration[MI_VIBRATION_HEADER];
@@ -201,11 +216,18 @@ static DWORD WINAPI _mi_output_thread_proc(LPVOID lparam)
                 vibration[MI_VIBRATION_SMALL_MOTOR] = desired[MI_VIBRATION_SMALL_MOTOR];
                 vibration[MI_VIBRATION_BIG_MOTOR] = desired[MI_VIBRATION_BIG_MOTOR];
                 timeout = INFINITE;
+                fail_logged = FALSE;
+                debug_log("gamepad %d rumble: small=%u big=%u", gp->id, desired[MI_VIBRATION_SMALL_MOTOR], desired[MI_VIBRATION_BIG_MOTOR]);
             }
             else
             {
                 // command failed, retry until it succeeds
                 timeout = MI_VIBRATION_RETRY_DELAY;
+                if (!fail_logged)
+                {
+                    fail_logged = TRUE;
+                    debug_log("gamepad %d rumble: send failed, retrying", gp->id);
+                }
             }
         }
         else

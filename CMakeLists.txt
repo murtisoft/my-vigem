@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(my-vigem VERSION 1.4.0 LANGUAGES C CXX RC)
+project(my-vigem VERSION 1.5.0 LANGUAGES C CXX RC)
 
 add_definitions(-DWIN32 -DUNICODE -D_UNICODE -D_CRT_NON_CONFORMING_SWPRINTFS)
 
@@ -37,7 +37,7 @@ set(APP_RC_FILE "${CMAKE_CURRENT_BINARY_DIR}/res.rc")
 file(GENERATE OUTPUT "${APP_RC_FILE}" CONTENT "${APP_RC_CONTENT}")
 
 add_executable(my-vigem WIN32
-    Sources/main.c Sources/utils.c Sources/tray.c Sources/hid.c Sources/hid_hide.c Sources/mi.c
+    Sources/main.c Sources/utils.c Sources/tray.c Sources/hid.c Sources/hid_hide.c Sources/mi.c Sources/debug_win.c
     Resources/ViGEmClient/src/ViGEmClient.cpp
     "${APP_RC_FILE}")
 

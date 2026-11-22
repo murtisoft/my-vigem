@@ -10,6 +10,7 @@
 #include "hid.h"
 #include "mi.h"
 #include "hid_hide.h"
+#include "debug_win.h"
 #include "utils.h"
 
 #ifndef _DEBUG
@@ -56,9 +57,11 @@ static void mi_gamepad_stop_cb(int gamepad_id, BYTE break_reason);
 static void CALLBACK x360_notification_cb(PVIGEM_CLIENT client, PVIGEM_TARGET target, UCHAR large_motor,
                                           UCHAR small_motor, UCHAR led_number, LPVOID user_data);
 static void refresh_cb(struct tray_menu *item);
+static void debug_cb(struct tray_menu *item);
 static void quit_cb(struct tray_menu *item);
 
 static const struct tray_menu tray_menu_refresh = { .text = TEXT("Refresh"), .cb = refresh_cb };
+static const struct tray_menu tray_menu_debug = { .text = TEXT("Debug"), .cb = debug_cb };
 static const struct tray_menu tray_menu_quit = { .text = TEXT("Quit"), .cb = quit_cb };
 static const struct tray_menu tray_menu_separator = { .text = TEXT("-") };
 static const struct tray_menu tray_menu_terminator = { .text = NULL };
@@ -90,7 +93,7 @@ static void rebuild_tray_menu()
     AcquireSRWLockShared(&active_devices_lock);
     int device_count = active_device_count;
     int dyn_item_count = device_count > 0 ? device_count + 1 : 0;
-    struct tray_menu *new_menu = (struct tray_menu *)malloc((dyn_item_count + 3) * sizeof(struct tray_menu));
+    struct tray_menu *new_menu = (struct tray_menu *)malloc((dyn_item_count + 4) * sizeof(struct tray_menu));
     if (new_menu == NULL)
     {
         ReleaseSRWLockShared(&active_devices_lock);
@@ -107,6 +110,7 @@ static void rebuild_tray_menu()
         new_menu[index++] = tray_menu_separator;
     }
     new_menu[index++] = tray_menu_refresh;
+    new_menu[index++] = tray_menu_debug;
     new_menu[index++] = tray_menu_quit;
     new_menu[index++] = tray_menu_terminator;
 
@@ -207,6 +211,7 @@ static BOOLEAN add_device(struct hid_device_info *device_info)
 
 static BOOLEAN remove_device(int mi_gamepad_id)
 {
+    debug_log("remove_device: gamepad %d", mi_gamepad_id);
     BOOLEAN removed = FALSE;
     AcquireSRWLockExclusive(&active_devices_lock);
     for (int i = 0; i < active_device_count; i++)
@@ -415,6 +420,7 @@ static void request_full_refresh(void)
 static void device_change_cb(UINT op, LPTSTR path)
 {
     // refresh devices regardless operation type
+    debug_log("device change: op=%u", op);
 #ifdef UNICODE
     printf("Device operation %d with path %S\n", op, path);
 #else
@@ -487,6 +493,7 @@ static void mi_gamepad_update_cb(int gamepad_id, struct mi_state *state)
 
 static void mi_gamepad_stop_cb(int gamepad_id, BYTE break_reason)
 {
+    debug_log("gamepad %d stopped, reason=0x%X", gamepad_id, break_reason);
     UINT ntf_type = break_reason == MI_BREAK_REASON_REQUESTED ? NT_TRAY_INFO : NT_TRAY_WARNING;
     LPTSTR ntf_text;
     switch (break_reason)
@@ -529,8 +536,16 @@ static void refresh_cb(struct tray_menu *item)
 {
     (void)item;
     printf("Refresh\n");
+    debug_log("Refresh requested");
     fflush(stdout);
     request_full_refresh();
+}
+
+static void debug_cb(struct tray_menu *item)
+{
+    (void)item;
+    debug_log("Debug");
+    debug_win_toggle();
 }
 
 static void quit_cb(struct tray_menu *item)
@@ -562,6 +577,7 @@ int main(int argc, char **argv)
         printf("Failed to create tray\n");
         return 1;
     }
+    mi_set_raw_cb(debug_win_set_report);
     vigem_client = vigem_alloc();
     VIGEM_ERROR vigem_res = vigem_connect(vigem_client);
     if (vigem_res == VIGEM_ERROR_BUS_NOT_FOUND)
@@ -639,6 +655,8 @@ int main(int argc, char **argv)
     {
         hid_hide_free();
     }
+    mi_set_raw_cb(NULL);
+    debug_win_free();
     free(tray.menu);
     return 0;
 }
