@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <tchar.h>
 
+#include "mi.h"
 #include "utils.h"
 
 #define DEBUG_WIN_CLASS TEXT("MiVigemDebugWindow")
@@ -17,6 +18,21 @@
 #define DEBUG_WIN_MAX_SLOTS 8
 #define DEBUG_WIN_MAX_REPORT 64
 #define DEBUG_WIN_LIVE_HEIGHT 260
+#define DEBUG_WIN_ROW_HEIGHT 32
+#define DEBUG_WIN_TOOLBAR_HEIGHT (2 * DEBUG_WIN_ROW_HEIGHT)
+#define DEBUG_WIN_BUTTON_WIDTH 105
+
+#define IDC_HEX 101
+#define IDC_PAD 102
+#define IDC_SEND_FEATURE 103
+#define IDC_SEND_OUTPUT 104
+#define IDC_GET_FEATURE 105
+#define IDC_INPUT_OFF 106
+#define IDC_INPUT_ON 107
+#define IDC_ACCEL_ON 108
+#define IDC_ACCEL_OFF 109
+#define IDC_SENS 110
+#define IDC_HID_INFO 111
 #define DEBUG_WIN_SLOT_TEXT 1200
 #define DEBUG_WIN_TIMER_ID 1
 #define DEBUG_WIN_TIMER_MS 100
@@ -36,6 +52,14 @@ static HWND debug_edit = NULL;
 static HANDLE debug_thread = NULL;
 static HANDLE debug_ready_event = NULL;
 static HWND debug_live_edit = NULL;
+static HWND debug_hex_edit = NULL;
+static HWND debug_id_edit = NULL;
+static HWND debug_pad_label = NULL;
+static HWND debug_raw_buttons[3];
+static HWND debug_preset_buttons[4];
+static HWND debug_info_button = NULL;
+static HWND debug_sens_label = NULL;
+static HWND debug_sens_edit = NULL;
 
 static struct report_slot report_slots[DEBUG_WIN_MAX_SLOTS];
 static SRWLOCK report_lock = SRWLOCK_INIT;
@@ -201,11 +225,204 @@ static void _debug_win_refresh_live(void)
     SetWindowText(debug_live_edit, text);
 }
 
+// Pad id typed in the Pad box, or the first gamepad seen sending reports. -1 if none.
+static int _debug_win_pick_gamepad(void)
+{
+    TCHAR id_text[16];
+    GetWindowText(debug_id_edit, id_text, sizeof(id_text) / sizeof(id_text[0]));
+    if (id_text[0] != TEXT('\0'))
+    {
+        return _ttoi(id_text);
+    }
+
+    int gamepad_id = -1;
+    AcquireSRWLockShared(&report_lock);
+    for (int i = 0; i < DEBUG_WIN_MAX_SLOTS; i++)
+    {
+        if (report_slots[i].used)
+        {
+            gamepad_id = report_slots[i].gamepad_id;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&report_lock);
+    return gamepad_id;
+}
+
+static void _debug_win_do_raw(BYTE kind)
+{
+    TCHAR text[512];
+    BYTE bytes[DEBUG_WIN_MAX_REPORT];
+    size_t count = 0;
+    int pending = -1;
+    BOOLEAN valid = TRUE;
+
+    GetWindowText(debug_hex_edit, text, sizeof(text) / sizeof(text[0]));
+    for (const TCHAR *p = text; *p != TEXT('\0') && valid; p++)
+    {
+        int digit = -1;
+        if (*p >= TEXT('0') && *p <= TEXT('9'))
+        {
+            digit = *p - TEXT('0');
+        }
+        else if (*p >= TEXT('a') && *p <= TEXT('f'))
+        {
+            digit = *p - TEXT('a') + 10;
+        }
+        else if (*p >= TEXT('A') && *p <= TEXT('F'))
+        {
+            digit = *p - TEXT('A') + 10;
+        }
+        else if (*p != TEXT(' ') && *p != TEXT(',') && *p != TEXT('\t'))
+        {
+            valid = FALSE;
+            break;
+        }
+
+        int byte_value = -1;
+        if (digit < 0)
+        {
+            // separator: a lone digit counts as a whole byte
+            byte_value = pending;
+            pending = -1;
+        }
+        else if (pending < 0)
+        {
+            pending = digit;
+        }
+        else
+        {
+            byte_value = (pending << 4) | digit;
+            pending = -1;
+        }
+        if (byte_value >= 0)
+        {
+            if (count >= sizeof(bytes))
+            {
+                valid = FALSE;
+                break;
+            }
+            bytes[count++] = (BYTE)byte_value;
+        }
+    }
+    if (valid && pending >= 0)
+    {
+        if (count >= sizeof(bytes))
+        {
+            valid = FALSE;
+        }
+        else
+        {
+            bytes[count++] = (BYTE)pending;
+        }
+    }
+    if (!valid || count == 0)
+    {
+        debug_log("raw: invalid hex input (use pairs like \"20 00 00\", max %d bytes)", DEBUG_WIN_MAX_REPORT);
+        return;
+    }
+
+    if (bytes[0] == 0x22 && kind != MI_RAW_GET_FEATURE
+        && MessageBox(debug_hwnd, TEXT("Report 0x22 writes calibration that the controller keeps permanently.\nA wrong packet can leave it reporting garbage.\n\nSend it anyway?"),
+                      TEXT("Calibration packet"), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
+    {
+        debug_log("raw: calibration packet cancelled");
+        return;
+    }
+
+    int gamepad_id = _debug_win_pick_gamepad();
+    if (gamepad_id < 0)
+    {
+        debug_log("raw: no gamepad seen yet, type its number in the Pad box");
+        return;
+    }
+
+    BYTE reply[256];
+    DWORD error = 0;
+    mi_gamepad_raw(gamepad_id, kind, bytes, count, reply, sizeof(reply), &error);
+}
+
+static void _debug_win_send_preset(const BYTE *bytes, size_t length)
+{
+    int gamepad_id = _debug_win_pick_gamepad();
+    if (gamepad_id < 0)
+    {
+        debug_log("raw: no gamepad seen yet, type its number in the Pad box");
+        return;
+    }
+    DWORD error = 0;
+    mi_gamepad_raw(gamepad_id, MI_RAW_SEND_FEATURE, bytes, length, NULL, 0, &error);
+}
+
+static BYTE _debug_win_sensitivity(void)
+{
+    TCHAR text[16];
+    GetWindowText(debug_sens_edit, text, sizeof(text) / sizeof(text[0]));
+    if (text[0] == TEXT('\0'))
+    {
+        return 0x08;
+    }
+    unsigned long value = _tcstoul(text, NULL, 16);
+    return (BYTE)(value > 0xFF ? 0xFF : value);
+}
+
 static LRESULT CALLBACK _debug_win_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
     switch (msg)
     {
     case WM_CREATE:
+    {
+        HINSTANCE inst = GetModuleHandle(NULL);
+        HGDIOBJ gui_font = GetStockObject(DEFAULT_GUI_FONT);
+        debug_hex_edit = CreateWindowEx(WS_EX_CLIENTEDGE, TEXT("EDIT"), TEXT("20 00 00"),
+                                        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+                                        0, 0, 0, 0, hwnd, (HMENU)IDC_HEX, inst, NULL);
+        SendMessage(debug_hex_edit, WM_SETFONT, (WPARAM)GetStockObject(ANSI_FIXED_FONT), TRUE);
+        debug_pad_label = CreateWindowEx(0, TEXT("STATIC"), TEXT("Pad:"), WS_CHILD | WS_VISIBLE | SS_RIGHT,
+                                         0, 0, 0, 0, hwnd, NULL, inst, NULL);
+        SendMessage(debug_pad_label, WM_SETFONT, (WPARAM)gui_font, TRUE);
+        debug_id_edit = CreateWindowEx(WS_EX_CLIENTEDGE, TEXT("EDIT"), TEXT(""),
+                                       WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_AUTOHSCROLL,
+                                       0, 0, 0, 0, hwnd, (HMENU)IDC_PAD, inst, NULL);
+        SendMessage(debug_id_edit, WM_SETFONT, (WPARAM)gui_font, TRUE);
+        static const struct { int id; LPCTSTR text; } raw_buttons[3] =
+        {
+            { IDC_SEND_FEATURE, TEXT("Send feature") },
+            { IDC_SEND_OUTPUT, TEXT("Send output") },
+            { IDC_GET_FEATURE, TEXT("Get feature") }
+        };
+        for (int i = 0; i < 3; i++)
+        {
+            debug_raw_buttons[i] = CreateWindowEx(0, TEXT("BUTTON"), raw_buttons[i].text,
+                                                  WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                                  0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)raw_buttons[i].id, inst, NULL);
+            SendMessage(debug_raw_buttons[i], WM_SETFONT, (WPARAM)gui_font, TRUE);
+        }
+        static const struct { int id; LPCTSTR text; } preset_buttons[4] =
+        {
+            { IDC_INPUT_OFF, TEXT("Input off (0x23)") },
+            { IDC_INPUT_ON, TEXT("Input on (0x23)") },
+            { IDC_ACCEL_ON, TEXT("Accel on (0x31)") },
+            { IDC_ACCEL_OFF, TEXT("Accel off (0x31)") }
+        };
+        for (int i = 0; i < 4; i++)
+        {
+            debug_preset_buttons[i] = CreateWindowEx(0, TEXT("BUTTON"), preset_buttons[i].text,
+                                                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                                     0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)preset_buttons[i].id, inst, NULL);
+            SendMessage(debug_preset_buttons[i], WM_SETFONT, (WPARAM)gui_font, TRUE);
+        }
+        debug_info_button = CreateWindowEx(0, TEXT("BUTTON"), TEXT("HID info"), WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                           0, 0, 0, 0, hwnd, (HMENU)IDC_HID_INFO, inst, NULL);
+        SendMessage(debug_info_button, WM_SETFONT, (WPARAM)gui_font, TRUE);
+        debug_sens_label = CreateWindowEx(0, TEXT("STATIC"), TEXT("Accel sens (hex):"), WS_CHILD | WS_VISIBLE | SS_RIGHT,
+                                          0, 0, 0, 0, hwnd, NULL, inst, NULL);
+        SendMessage(debug_sens_label, WM_SETFONT, (WPARAM)gui_font, TRUE);
+        debug_sens_edit = CreateWindowEx(WS_EX_CLIENTEDGE, TEXT("EDIT"), TEXT("08"),
+                                         WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+                                         0, 0, 0, 0, hwnd, (HMENU)IDC_SENS, inst, NULL);
+        SendMessage(debug_sens_edit, WM_SETFONT, (WPARAM)gui_font, TRUE);
+    }
         debug_live_edit = CreateWindowEx(WS_EX_CLIENTEDGE, TEXT("EDIT"), TEXT(""),
                                          WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY,
                                          0, 0, 0, 0, hwnd, NULL, GetModuleHandle(NULL), NULL);
@@ -222,11 +439,90 @@ static LRESULT CALLBACK _debug_win_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
     {
         int width = LOWORD(lparam);
         int height = HIWORD(lparam);
-        int live_height = height < DEBUG_WIN_LIVE_HEIGHT ? height : DEBUG_WIN_LIVE_HEIGHT;
-        MoveWindow(debug_live_edit, 0, 0, width, live_height, TRUE);
-        MoveWindow(debug_edit, 0, live_height, width, height - live_height, TRUE);
+        int toolbar = height < DEBUG_WIN_TOOLBAR_HEIGHT ? height : DEBUG_WIN_TOOLBAR_HEIGHT;
+        int rest = height - toolbar;
+        int live_height = rest < DEBUG_WIN_LIVE_HEIGHT ? rest : DEBUG_WIN_LIVE_HEIGHT;
+
+        int buttons_x = width - 3 * DEBUG_WIN_BUTTON_WIDTH;
+        for (int i = 0; i < 3; i++)
+        {
+            MoveWindow(debug_raw_buttons[i], buttons_x + i * DEBUG_WIN_BUTTON_WIDTH, 2, DEBUG_WIN_BUTTON_WIDTH, DEBUG_WIN_ROW_HEIGHT - 4, TRUE);
+        }
+        MoveWindow(debug_id_edit, buttons_x - 44, 3, 40, DEBUG_WIN_ROW_HEIGHT - 6, TRUE);
+        MoveWindow(debug_pad_label, buttons_x - 98, 8, 50, 18, TRUE);
+        MoveWindow(debug_hex_edit, 0, 3, buttons_x > 150 ? buttons_x - 102 : 48, DEBUG_WIN_ROW_HEIGHT - 6, TRUE);
+
+        for (int i = 0; i < 4; i++)
+        {
+            MoveWindow(debug_preset_buttons[i], i * DEBUG_WIN_BUTTON_WIDTH, DEBUG_WIN_ROW_HEIGHT + 2, DEBUG_WIN_BUTTON_WIDTH, DEBUG_WIN_ROW_HEIGHT - 4, TRUE);
+        }
+        MoveWindow(debug_info_button, 4 * DEBUG_WIN_BUTTON_WIDTH, DEBUG_WIN_ROW_HEIGHT + 2, DEBUG_WIN_BUTTON_WIDTH, DEBUG_WIN_ROW_HEIGHT - 4, TRUE);
+        MoveWindow(debug_sens_label, 5 * DEBUG_WIN_BUTTON_WIDTH + 6, DEBUG_WIN_ROW_HEIGHT + 8, 100, 18, TRUE);
+        MoveWindow(debug_sens_edit, 5 * DEBUG_WIN_BUTTON_WIDTH + 110, DEBUG_WIN_ROW_HEIGHT + 3, 40, DEBUG_WIN_ROW_HEIGHT - 6, TRUE);
+
+        MoveWindow(debug_live_edit, 0, toolbar, width, live_height, TRUE);
+        MoveWindow(debug_edit, 0, toolbar + live_height, width, rest - live_height, TRUE);
         return 0;
     }
+
+    case WM_COMMAND:
+        if (HIWORD(wparam) == BN_CLICKED)
+        {
+            switch (LOWORD(wparam))
+            {
+            case IDC_SEND_FEATURE:
+                _debug_win_do_raw(MI_RAW_SEND_FEATURE);
+                break;
+            case IDC_SEND_OUTPUT:
+                _debug_win_do_raw(MI_RAW_SEND_OUTPUT);
+                break;
+            case IDC_GET_FEATURE:
+                _debug_win_do_raw(MI_RAW_GET_FEATURE);
+                break;
+            case IDC_INPUT_OFF:
+            {
+                static const BYTE input_off[2] = { 0x23, 0x01 };
+                if (MessageBox(hwnd, TEXT("This stops all input from the controller (except the Mi button) until \"Input on\" is sent.\n\nContinue?"),
+                               TEXT("Stop input"), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES)
+                {
+                    _debug_win_send_preset(input_off, sizeof(input_off));
+                }
+                break;
+            }
+            case IDC_INPUT_ON:
+            {
+                static const BYTE input_on[2] = { 0x23, 0x00 };
+                _debug_win_send_preset(input_on, sizeof(input_on));
+                break;
+            }
+            case IDC_ACCEL_ON:
+            {
+                BYTE accel_on[3] = { 0x31, 0x01, _debug_win_sensitivity() };
+                _debug_win_send_preset(accel_on, sizeof(accel_on));
+                break;
+            }
+            case IDC_HID_INFO:
+            {
+                int gamepad_id = _debug_win_pick_gamepad();
+                if (gamepad_id < 0)
+                {
+                    debug_log("describe: no gamepad seen yet, type its number in the Pad box");
+                }
+                else if (!mi_gamepad_describe(gamepad_id))
+                {
+                    debug_log("describe: gamepad %d not found", gamepad_id);
+                }
+                break;
+            }
+            case IDC_ACCEL_OFF:
+            {
+                static const BYTE accel_off[3] = { 0x31, 0x00, 0x00 };
+                _debug_win_send_preset(accel_off, sizeof(accel_off));
+                break;
+            }
+            }
+        }
+        return 0;
 
     case WM_TIMER:
         if (wparam == DEBUG_WIN_TIMER_ID && IsWindowVisible(hwnd))

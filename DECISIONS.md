@@ -53,3 +53,5 @@ Durable project choices, deduced from the code. Follow them; fix a line when a s
 - It shows raw report bytes, the report decoded per `PROTOCOL.md` (unknown bits/bytes are listed), and the event log. The decoder in `debug_win.c` is independent of `mi.c` on purpose, so it shows what the hardware sends, not what the app assumes.
 - All `debug_log` output goes to the console (`--debug`) and to the window; use it for anything worth seeing there.
 - The raw report hook (`mi_set_raw_cb`) runs on the input thread: keep it cheap, no blocking.
+- Raw probing (hex box + `Send feature` / `Send output` / `Get feature`) targets the Pad id typed in the box, or the first gamepad seen reporting. Every raw call is logged with its result and Win32 error. Report `0x22` (calibration, permanent on the pad) asks for confirmation before sending.
+- Preset buttons: `Input off/on` (`0x23`; off asks for confirmation) and `Accel on/off` (`0x31`, sensitivity from a hex box, default 08 like the old unused `enable_accel` constant).

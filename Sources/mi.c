@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <tchar.h>
 #include <windows.h>
 #include <synchapi.h>
@@ -378,6 +379,103 @@ void mi_gamepad_set_vibration(int gamepad_id, BYTE small_motor, BYTE big_motor)
         ReleaseSRWLockExclusive(&cur_gp->vibr_lock);
         SetEvent(cur_gp->out_event);
     }
+}
+
+static void _mi_hex(char *dst, size_t dst_size, const BYTE *data, size_t length)
+{
+    size_t pos = 0;
+    dst[0] = '\0';
+    for (size_t i = 0; i < length && pos + 4 < dst_size; i++)
+    {
+        pos += snprintf(dst + pos, dst_size - pos, "%02X ", data[i]);
+    }
+}
+
+INT mi_gamepad_raw(int gamepad_id, BYTE kind, const BYTE *in, size_t in_len, BYTE *out, size_t out_size, DWORD *error)
+{
+    static const char *kind_names[] = { "send feature", "send output", "get feature" };
+
+    if (kind > MI_RAW_GET_FEATURE || in == NULL || in_len == 0
+        || (kind == MI_RAW_GET_FEATURE && (out == NULL || out_size == 0)))
+    {
+        if (error != NULL)
+        {
+            *error = ERROR_INVALID_PARAMETER;
+        }
+        return -1;
+    }
+
+    INT result = -2;
+    DWORD err = ERROR_NOT_FOUND;
+
+    // keep gp_lock shared for the whole call so the gamepad cannot be torn down meanwhile.
+    // note: send feature shares the device feature buffer with the rumble thread, fine for manual probing.
+    AcquireSRWLockShared(&gp_lock);
+    struct mi_gamepad *cur_gp = root_gp;
+    while (cur_gp != NULL && cur_gp->id != gamepad_id)
+    {
+        cur_gp = cur_gp->next;
+    }
+    if (cur_gp != NULL)
+    {
+        SetLastError(0);
+        switch (kind)
+        {
+        case MI_RAW_SEND_FEATURE:
+            result = hid_send_feature_report(cur_gp->device, in, in_len);
+            break;
+        case MI_RAW_SEND_OUTPUT:
+            result = hid_send_output_report(cur_gp->device, in, in_len);
+            break;
+        default:
+            result = hid_get_feature_report(cur_gp->device, in[0], out, out_size);
+            break;
+        }
+        err = result < 0 ? GetLastError() : 0;
+    }
+    ReleaseSRWLockShared(&gp_lock);
+
+    char hex[256];
+    _mi_hex(hex, sizeof(hex), in, in_len);
+    if (result >= 0)
+    {
+        debug_log("gamepad %d raw %s [%s] -> %d bytes", gamepad_id, kind_names[kind], hex, (int)result);
+        if (kind == MI_RAW_GET_FEATURE)
+        {
+            _mi_hex(hex, sizeof(hex), out, (size_t)result);
+            debug_log("  reply: %s", hex);
+        }
+    }
+    else
+    {
+        debug_log("gamepad %d raw %s [%s] failed, result=%d error=%lu", gamepad_id, kind_names[kind], hex, (int)result, err);
+    }
+
+    if (error != NULL)
+    {
+        *error = err;
+    }
+    return result;
+}
+
+BOOLEAN mi_gamepad_describe(int gamepad_id)
+{
+    BOOLEAN found = FALSE;
+
+    // gp_lock stays shared during the call so the gamepad cannot be torn down meanwhile
+    AcquireSRWLockShared(&gp_lock);
+    struct mi_gamepad *cur_gp = root_gp;
+    while (cur_gp != NULL && cur_gp->id != gamepad_id)
+    {
+        cur_gp = cur_gp->next;
+    }
+    if (cur_gp != NULL)
+    {
+        found = TRUE;
+        hid_describe_device(cur_gp->device);
+    }
+    ReleaseSRWLockShared(&gp_lock);
+    return found;
 }
 
 void mi_gamepad_stop(int gamepad_id)

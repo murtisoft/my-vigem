@@ -43,6 +43,10 @@ struct hid_device *hid_open_device(struct hid_device_info *device_info, BOOLEAN 
 INT hid_get_input_report(struct hid_device *device, DWORD timeout);
 INT hid_send_output_report(struct hid_device *device, const void *data, size_t length);
 INT hid_send_feature_report(struct hid_device *device, const void *data, size_t length);
+// Read a feature report by ID into out (report ID is out[0]). Returns the byte count copied, or -1 on failure (see GetLastError).
+// Log the device's HID descriptor summary (attributes, report sizes, button/value caps per report type) with debug_log.
+void hid_describe_device(struct hid_device *device);
+INT hid_get_feature_report(struct hid_device *device, BYTE report_id, void *out, size_t out_size);
 void hid_close_device(struct hid_device *device);
 void hid_free_device(struct hid_device *device);
 

@@ -62,4 +62,16 @@ int mi_gamepad_start(struct hid_device *device, void (*upd_cb)(int, struct mi_st
 void mi_gamepad_set_vibration(int gamepad_id, BYTE small_motor, BYTE big_motor);
 void mi_gamepad_stop(int gamepad_id);
 
+#define MI_RAW_SEND_FEATURE 0
+#define MI_RAW_SEND_OUTPUT  1
+#define MI_RAW_GET_FEATURE  2
+
+// Debug/probing: send arbitrary bytes (feature or output report) or read a feature report (ID = in[0], reply in out)
+// on a live gamepad. Returns bytes transferred, -1 on failure, -2 if the gamepad does not exist.
+// *error (optional) receives the Win32 error, 0 on success. The call is logged with debug_log.
+// Debug: log the HID descriptor summary of a live gamepad. Returns FALSE if the gamepad does not exist.
+BOOLEAN mi_gamepad_describe(int gamepad_id);
+
+INT mi_gamepad_raw(int gamepad_id, BYTE kind, const BYTE *in, size_t in_len, BYTE *out, size_t out_size, DWORD *error);
+
 #endif /* MI_H */

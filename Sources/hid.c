@@ -621,6 +621,116 @@ INT hid_send_feature_report(struct hid_device *device, const void *data, size_t 
     return -1;
 }
 
+INT hid_get_feature_report(struct hid_device *device, BYTE report_id, void *out, size_t out_size)
+{
+    // own buffer: the shared feature_buffer belongs to the rumble sender
+    size_t size = device->feature_report_size;
+    if (size == 0)
+    {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return -1;
+    }
+    BYTE *buffer = (BYTE *)malloc(size);
+    if (buffer == NULL)
+    {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return -1;
+    }
+    _mem_zero(buffer, size);
+    buffer[0] = report_id;
+
+    INT result = -1;
+    if (HidD_GetFeature(device->handle, buffer, (ULONG)size))
+    {
+        size_t count = size < out_size ? size : out_size;
+        _mem_copy(out, buffer, count);
+        result = (INT)count;
+    }
+    free(buffer);
+    return result;
+}
+
+static void _hid_describe_caps(PHIDP_PREPARSED_DATA pp_data, HIDP_REPORT_TYPE type, const char *name,
+                               USHORT button_count, USHORT value_count)
+{
+    if (button_count > 0)
+    {
+        PHIDP_BUTTON_CAPS buttons = (PHIDP_BUTTON_CAPS)malloc(button_count * sizeof(HIDP_BUTTON_CAPS));
+        if (buttons != NULL && HidP_GetButtonCaps(type, buttons, &button_count, pp_data) == HIDP_STATUS_SUCCESS)
+        {
+            for (USHORT i = 0; i < button_count; i++)
+            {
+                if (buttons[i].IsRange)
+                {
+                    debug_log("  %s buttons: id=%u page=0x%04X usages 0x%04X-0x%04X link=%u", name, buttons[i].ReportID,
+                              buttons[i].UsagePage, buttons[i].Range.UsageMin, buttons[i].Range.UsageMax, buttons[i].LinkCollection);
+                }
+                else
+                {
+                    debug_log("  %s button: id=%u page=0x%04X usage=0x%04X link=%u", name, buttons[i].ReportID,
+                              buttons[i].UsagePage, buttons[i].NotRange.Usage, buttons[i].LinkCollection);
+                }
+            }
+        }
+        free(buttons);
+    }
+
+    if (value_count > 0)
+    {
+        PHIDP_VALUE_CAPS values = (PHIDP_VALUE_CAPS)malloc(value_count * sizeof(HIDP_VALUE_CAPS));
+        if (values != NULL && HidP_GetValueCaps(type, values, &value_count, pp_data) == HIDP_STATUS_SUCCESS)
+        {
+            for (USHORT i = 0; i < value_count; i++)
+            {
+                USHORT usage_min = values[i].IsRange ? values[i].Range.UsageMin : values[i].NotRange.Usage;
+                USHORT usage_max = values[i].IsRange ? values[i].Range.UsageMax : values[i].NotRange.Usage;
+                debug_log("  %s value: id=%u page=0x%04X usage=0x%04X-0x%04X bits=%u count=%u logical=%ld..%ld link=%u", name,
+                          values[i].ReportID, values[i].UsagePage, usage_min, usage_max, values[i].BitSize,
+                          values[i].ReportCount, (long)values[i].LogicalMin, (long)values[i].LogicalMax, values[i].LinkCollection);
+            }
+        }
+        free(values);
+    }
+}
+
+void hid_describe_device(struct hid_device *device)
+{
+    HIDD_ATTRIBUTES attributes;
+    attributes.Size = sizeof(attributes);
+    if (HidD_GetAttributes(device->handle, &attributes))
+    {
+        debug_log("HID attributes: vendor=0x%04X product=0x%04X version=0x%04X", attributes.VendorID, attributes.ProductID, attributes.VersionNumber);
+    }
+
+    PHIDP_PREPARSED_DATA pp_data = NULL;
+    if (!HidD_GetPreparsedData(device->handle, &pp_data))
+    {
+        debug_log("HID descriptor: HidD_GetPreparsedData failed, error=%lu", GetLastError());
+        return;
+    }
+
+    HIDP_CAPS caps;
+    if (HidP_GetCaps(pp_data, &caps) != HIDP_STATUS_SUCCESS)
+    {
+        debug_log("HID descriptor: HidP_GetCaps failed");
+        HidD_FreePreparsedData(pp_data);
+        return;
+    }
+
+    debug_log("HID caps: usage page=0x%04X usage=0x%04X collections=%u", caps.UsagePage, caps.Usage, caps.NumberLinkCollectionNodes);
+    debug_log("  report bytes (with ID): input=%u output=%u feature=%u", caps.InputReportByteLength,
+              caps.OutputReportByteLength, caps.FeatureReportByteLength);
+    debug_log("  input: %u button caps, %u value caps; output: %u, %u; feature: %u, %u",
+              caps.NumberInputButtonCaps, caps.NumberInputValueCaps, caps.NumberOutputButtonCaps,
+              caps.NumberOutputValueCaps, caps.NumberFeatureButtonCaps, caps.NumberFeatureValueCaps);
+
+    _hid_describe_caps(pp_data, HidP_Input, "input", caps.NumberInputButtonCaps, caps.NumberInputValueCaps);
+    _hid_describe_caps(pp_data, HidP_Output, "output", caps.NumberOutputButtonCaps, caps.NumberOutputValueCaps);
+    _hid_describe_caps(pp_data, HidP_Feature, "feature", caps.NumberFeatureButtonCaps, caps.NumberFeatureValueCaps);
+
+    HidD_FreePreparsedData(pp_data);
+}
+
 void hid_close_device(struct hid_device *device)
 {
     CancelIoEx(device->handle, NULL);
