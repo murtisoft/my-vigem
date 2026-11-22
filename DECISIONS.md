@@ -5,7 +5,7 @@ Durable project choices, deduced from the code. Follow them; fix a line when a s
 ## Platform / build
 - Windows-only, plain C (C99) with the vendored ViGEmClient C++ file; CMake project `my-vigem`, MinGW-style static link (`-static`).
 - UNICODE build (`-DUNICODE -D_UNICODE`), but code stays TCHAR-clean (`LPTSTR`, `TEXT()`, `_tcs*`, `DBG_TSTR` for log formats).
-- Version lives in `CMakeLists.txt` (`project(... VERSION x.y.z)`); the `.rc` (icon `APP_ICON` + version info) is generated into the build dir.
+- Version lives in `CMakeLists.txt` (`project(... VERSION x.y.z)`), passed to code as the `APP_VERSION_STR` string define; the `.rc` (icon `APP_ICON` + version info) is generated into the build dir.
 - Tray app, GUI subsystem (no console). `--debug` flag attaches/allocs a console for `debug_log`.
 - Files use CRLF line endings; 4-space indent, Allman braces, `snake_case`, `_` prefix for internal helpers.
 - No third-party libs besides ViGEmClient; own helpers in `utils.c` (`_mem_zero`, `_mem_copy`, `_tcsistr`, `_guid_to_str`).
@@ -42,14 +42,15 @@ Durable project choices, deduced from the code. Follow them; fix a line when a s
 - On exit: restore HidHide's initial active state; the blacklist/whitelist entries we added are not otherwise restored besides per-device unbind.
 
 ## UI
-- Tray icon only: menu lists `#N Xiaomi Gamepad (batt. X%)` items, a separator, `Refresh`, `Quit`.
+- Tray icon only: menu lists `#N Xiaomi Gamepad (batt. X%)` items (N = XInput slot + 1, clicking one vibrates that pad for 500 ms), a separator, `Refresh`, (`Debug`, debug builds only), a separator, `Autostart at Logon` (checked), `GitHub Page`, a separator, `Quit  (ver. x.y.z)`.
+- Autostart = HKCU `...\Run` value `My-ViGEm` holding the quoted exe path (`autostart.c`); enabled only if the stored path equals the running exe. State is cached in `autostart_checked`.
 - Menu is rebuilt from `active_devices` (`rebuild_tray_menu`) then applied with `tray_update`.
 - Notifications are balloon tips (10 s), levels info/warning/error.
 - Tray menu uses `-` text as a separator and a `NULL` text terminator.
 
 ## Debug / docs
 - Protocol knowledge lives in `PROTOCOL.md` (from the author's readme + code); keep it the single reference. Mark each packet confirmed/unknown.
-- Debug window is a plain Win32 window (no extra libs) on its own thread, opened from the tray `Debug` item; closing it only hides it (log is kept).
+- Debug window is a plain Win32 window (no extra libs) on its own thread, opened from the tray `Debug` item (only built with `MY_VIGEM_DEBUG`, i.e. the CMake Debug config); closing it only hides it (log is kept).
 - It shows raw report bytes, the report decoded per `PROTOCOL.md` (unknown bits/bytes are listed), and the event log. The decoder in `debug_win.c` is independent of `mi.c` on purpose, so it shows what the hardware sends, not what the app assumes.
 - All `debug_log` output goes to the console (`--debug`) and to the window; use it for anything worth seeing there.
 - The raw report hook (`mi_set_raw_cb`) runs on the input thread: keep it cheap, no blocking.

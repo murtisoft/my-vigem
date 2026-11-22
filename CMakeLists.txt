@@ -37,11 +37,13 @@ set(APP_RC_FILE "${CMAKE_CURRENT_BINARY_DIR}/res.rc")
 file(GENERATE OUTPUT "${APP_RC_FILE}" CONTENT "${APP_RC_CONTENT}")
 
 add_executable(my-vigem WIN32
-    Sources/main.c Sources/utils.c Sources/tray.c Sources/hid.c Sources/hid_hide.c Sources/mi.c Sources/debug_win.c
+    Sources/main.c Sources/utils.c Sources/tray.c Sources/hid.c Sources/hid_hide.c Sources/mi.c Sources/debug_win.c Sources/autostart.c
     Resources/ViGEmClient/src/ViGEmClient.cpp
     "${APP_RC_FILE}")
 
 target_include_directories(my-vigem PRIVATE Resources/ViGEmClient/include)
+target_compile_definitions(my-vigem PRIVATE $<$<CONFIG:Debug>:MY_VIGEM_DEBUG>)
+target_compile_definitions(my-vigem PRIVATE APP_VERSION_STR=\"${PROJECT_VERSION}\")
 # Silence false positives from the vendored ViGEm headers and Clazy
 target_compile_options(my-vigem PRIVATE)
 target_link_libraries(my-vigem PRIVATE

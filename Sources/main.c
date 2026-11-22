@@ -11,6 +11,7 @@
 #include "mi.h"
 #include "hid_hide.h"
 #include "debug_win.h"
+#include "autostart.h"
 #include "utils.h"
 
 #ifndef _DEBUG
@@ -37,7 +38,14 @@ struct active_device
     LPTSTR tray_text;
     struct tray_menu *tray_menu;
     BOOLEAN hid_hidden;
+    int xinput_slot; // 0..3 XInput user index of the virtual pad, -1 if unknown
 };
+
+// number shown in the tray: XInput slot + 1 when known, otherwise our own running index
+static int _device_number(const struct active_device *device)
+{
+    return device->xinput_slot >= 0 ? device->xinput_slot + 1 : device->index;
+}
 
 static int last_active_device_index = 0;
 static int active_device_count = 0;
@@ -56,15 +64,26 @@ static void mi_gamepad_update_cb(int gamepad_id, struct mi_state *state);
 static void mi_gamepad_stop_cb(int gamepad_id, BYTE break_reason);
 static void CALLBACK x360_notification_cb(PVIGEM_CLIENT client, PVIGEM_TARGET target, UCHAR large_motor,
                                           UCHAR small_motor, UCHAR led_number, LPVOID user_data);
+static void pad_menu_cb(struct tray_menu *item);
 static void refresh_cb(struct tray_menu *item);
+#ifdef MY_VIGEM_DEBUG
 static void debug_cb(struct tray_menu *item);
+#endif
+static void autostart_cb(struct tray_menu *item);
+static void github_cb(struct tray_menu *item);
 static void quit_cb(struct tray_menu *item);
 
 static const struct tray_menu tray_menu_refresh = { .text = TEXT("Refresh"), .cb = refresh_cb };
+#ifdef MY_VIGEM_DEBUG
 static const struct tray_menu tray_menu_debug = { .text = TEXT("Debug"), .cb = debug_cb };
-static const struct tray_menu tray_menu_quit = { .text = TEXT("Quit"), .cb = quit_cb };
+#endif
+static const struct tray_menu tray_menu_github = { .text = TEXT("GitHub Page"), .cb = github_cb };
+static struct tray_menu tray_menu_autostart = { .text = TEXT("Autostart at Logon"), .cb = autostart_cb };
+#define _TEXT_EXPAND(x) TEXT(x)
+static const struct tray_menu tray_menu_quit = { .text = TEXT("Quit  (ver. ") _TEXT_EXPAND(APP_VERSION_STR) TEXT(")"), .cb = quit_cb };
 static const struct tray_menu tray_menu_separator = { .text = TEXT("-") };
 static const struct tray_menu tray_menu_terminator = { .text = NULL };
+static BOOLEAN autostart_checked = FALSE;
 static struct tray tray =
 {
     .icon = TEXT("APP_ICON"),
@@ -93,7 +112,7 @@ static void rebuild_tray_menu()
     AcquireSRWLockShared(&active_devices_lock);
     int device_count = active_device_count;
     int dyn_item_count = device_count > 0 ? device_count + 1 : 0;
-    struct tray_menu *new_menu = (struct tray_menu *)malloc((dyn_item_count + 4) * sizeof(struct tray_menu));
+    struct tray_menu *new_menu = (struct tray_menu *)malloc((dyn_item_count + 9) * sizeof(struct tray_menu));
     if (new_menu == NULL)
     {
         ReleaseSRWLockShared(&active_devices_lock);
@@ -110,7 +129,14 @@ static void rebuild_tray_menu()
         new_menu[index++] = tray_menu_separator;
     }
     new_menu[index++] = tray_menu_refresh;
+#ifdef MY_VIGEM_DEBUG
     new_menu[index++] = tray_menu_debug;
+#endif
+    new_menu[index++] = tray_menu_separator;
+    tray_menu_autostart.checked = autostart_checked;
+    new_menu[index++] = tray_menu_autostart;
+    new_menu[index++] = tray_menu_github;
+    new_menu[index++] = tray_menu_separator;
     new_menu[index++] = tray_menu_quit;
     new_menu[index++] = tray_menu_terminator;
 
@@ -172,19 +198,28 @@ static BOOLEAN add_device(struct hid_device_info *device_info)
     active_device->index = ++last_active_device_index;
     active_device->src_gamepad_id = mi_gamepad_id;
     active_device->src_battery_level = -1;
+    active_device->xinput_slot = -1;
     if (vigem_connected)
     {
         active_device->tgt_device = vigem_target_x360_alloc();
         vigem_target_add(vigem_client, active_device->tgt_device);
+        ULONG user_index = 0;
+        if (VIGEM_SUCCESS(vigem_target_x360_get_user_index(vigem_client, active_device->tgt_device, &user_index)))
+        {
+            active_device->xinput_slot = (int)user_index;
+        }
+        debug_log("gamepad %d: xinput slot %d", mi_gamepad_id, active_device->xinput_slot);
         XUSB_REPORT_INIT(&active_device->tgt_report);
         vigem_target_x360_register_notification(vigem_client, active_device->tgt_device, x360_notification_cb,
                                                 (LPVOID)active_device);
     }
-    int tray_text_length = _sctprintf(ACTIVE_DEVICE_MENU_TEMPLATE, active_device->index, BATTERY_NA_TEXT);
+    int tray_text_length = _sctprintf(ACTIVE_DEVICE_MENU_TEMPLATE, _device_number(active_device), BATTERY_NA_TEXT);
     active_device->tray_text = (LPTSTR)malloc((tray_text_length + 1) * sizeof(TCHAR));
-    _stprintf(active_device->tray_text, ACTIVE_DEVICE_MENU_TEMPLATE, active_device->index, BATTERY_NA_TEXT);
+    _stprintf(active_device->tray_text, ACTIVE_DEVICE_MENU_TEMPLATE, _device_number(active_device), BATTERY_NA_TEXT);
     active_device->tray_menu = (struct tray_menu *)calloc(1, sizeof(struct tray_menu));
     active_device->tray_menu->text = active_device->tray_text;
+    active_device->tray_menu->cb = pad_menu_cb;
+    active_device->tray_menu->context = (void *)(INT_PTR)mi_gamepad_id;
     active_device->hid_hidden = hid_hide_bind(device->device_info) == HID_HIDE_RESULT_OK;
 
     AcquireSRWLockExclusive(&active_devices_lock);
@@ -454,10 +489,10 @@ static void mi_gamepad_update_cb(int gamepad_id, struct mi_state *state)
         active_device->src_battery_level = state->battery;
         TCHAR battery_buffer[5];
         _stprintf(battery_buffer, TEXT("%d%%"), active_device->src_battery_level);
-        int tray_text_length = _sctprintf(ACTIVE_DEVICE_MENU_TEMPLATE, active_device->index, battery_buffer);
+        int tray_text_length = _sctprintf(ACTIVE_DEVICE_MENU_TEMPLATE, _device_number(active_device), battery_buffer);
         free(active_device->tray_text);
         active_device->tray_text = (LPTSTR)malloc((tray_text_length + 1) * sizeof(TCHAR));
-        _stprintf(active_device->tray_text, ACTIVE_DEVICE_MENU_TEMPLATE, active_device->index, battery_buffer);
+        _stprintf(active_device->tray_text, ACTIVE_DEVICE_MENU_TEMPLATE, _device_number(active_device), battery_buffer);
         active_device->tray_menu->text = active_device->tray_text;
         rebuild_tray_menu();
         tray_update(&tray);
@@ -532,6 +567,11 @@ static void CALLBACK x360_notification_cb(PVIGEM_CLIENT client, PVIGEM_TARGET ta
     mi_gamepad_set_vibration(active_device->src_gamepad_id, small_motor, large_motor);
 }
 
+static void pad_menu_cb(struct tray_menu *item)
+{
+    mi_gamepad_identify((int)(INT_PTR)item->context);
+}
+
 static void refresh_cb(struct tray_menu *item)
 {
     (void)item;
@@ -541,11 +581,38 @@ static void refresh_cb(struct tray_menu *item)
     request_full_refresh();
 }
 
+#ifdef MY_VIGEM_DEBUG
 static void debug_cb(struct tray_menu *item)
 {
     (void)item;
     debug_log("Debug");
     debug_win_toggle();
+}
+#endif
+
+static void autostart_cb(struct tray_menu *item)
+{
+    (void)item;
+    BOOLEAN enable = !autostart_checked;
+    if (autostart_set(enable))
+    {
+        autostart_checked = enable;
+        debug_log("Autostart %s", enable ? "enabled" : "disabled");
+    }
+    else
+    {
+        debug_log("Autostart change failed");
+        tray_show_notification(NT_TRAY_ERROR, TEXT("Autostart at Logon"),
+                               TEXT("Could not change the autostart setting."));
+    }
+    rebuild_tray_menu();
+    tray_update(&tray);
+}
+
+static void github_cb(struct tray_menu *item)
+{
+    (void)item;
+    ShellExecute(NULL, TEXT("open"), TEXT("https://github.com/murtisoft/my-vigem"), NULL, NULL, SW_SHOWNORMAL);
 }
 
 static void quit_cb(struct tray_menu *item)
@@ -565,6 +632,7 @@ int main(int argc, char **argv)
             debug_console_enable();
         }
     }
+    autostart_checked = autostart_is_enabled();
     rebuild_tray_menu();
     int tray_res = tray_init(&tray);
     if (tray_res > 0)

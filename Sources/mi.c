@@ -381,6 +381,27 @@ void mi_gamepad_set_vibration(int gamepad_id, BYTE small_motor, BYTE big_motor)
     }
 }
 
+#define MI_IDENTIFY_DURATION_MS 500
+
+static DWORD WINAPI _mi_identify_thread_proc(LPVOID lparam)
+{
+    int gamepad_id = (int)(INT_PTR)lparam;
+    mi_gamepad_set_vibration(gamepad_id, 0xFF, 0xFF);
+    Sleep(MI_IDENTIFY_DURATION_MS);
+    mi_gamepad_set_vibration(gamepad_id, 0x00, 0x00);
+    return 0;
+}
+
+void mi_gamepad_identify(int gamepad_id)
+{
+    HANDLE thread = CreateThread(NULL, 0, _mi_identify_thread_proc, (LPVOID)(INT_PTR)gamepad_id, 0, NULL);
+    if (thread != NULL)
+    {
+        CloseHandle(thread);
+    }
+    debug_log("gamepad %d identify", gamepad_id);
+}
+
 static void _mi_hex(char *dst, size_t dst_size, const BYTE *data, size_t length)
 {
     size_t pos = 0;

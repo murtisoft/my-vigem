@@ -61,6 +61,8 @@ void mi_set_raw_cb(mi_raw_cb_t cb);
 int mi_gamepad_start(struct hid_device *device, void (*upd_cb)(int, struct mi_state *), void (*stop_cb)(int, BYTE));
 void mi_gamepad_set_vibration(int gamepad_id, BYTE small_motor, BYTE big_motor);
 void mi_gamepad_stop(int gamepad_id);
+// Briefly vibrates the pad (both motors, non-blocking) so the user can tell which one it is.
+void mi_gamepad_identify(int gamepad_id);
 
 #define MI_RAW_SEND_FEATURE 0
 #define MI_RAW_SEND_OUTPUT  1
