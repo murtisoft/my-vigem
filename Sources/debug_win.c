@@ -109,7 +109,7 @@ static size_t _debug_win_format_slot(const struct report_slot *slot, TCHAR *out)
     const BYTE *d = slot->data;
     size_t length = 0;
 
-    length += _stprintf(out + length, TEXT("Gamepad %d, %lu bytes:\r\n"), slot->gamepad_id, slot->size);
+    length += _stprintf(out + length, TEXT("Gamepad id %d, %lu bytes:\r\n"), slot->gamepad_id, slot->size);
     for (DWORD b = 0; b < slot->size; b++)
     {
         length += _stprintf(out + length, TEXT("%02X "), d[b]);
@@ -225,7 +225,7 @@ static void _debug_win_refresh_live(void)
     SetWindowText(debug_live_edit, text);
 }
 
-// Pad id typed in the Pad box, or the first gamepad seen sending reports. -1 if none.
+// Internal gamepad id typed in the Pad id box (the tray shows the XInput slot instead), or the first gamepad seen sending reports. -1 if none.
 static int _debug_win_pick_gamepad(void)
 {
     TCHAR id_text[16];
@@ -333,7 +333,7 @@ static void _debug_win_do_raw(BYTE kind)
     int gamepad_id = _debug_win_pick_gamepad();
     if (gamepad_id < 0)
     {
-        debug_log("raw: no gamepad seen yet, type its number in the Pad box");
+        debug_log("raw: no gamepad seen yet, type its id (see 'Gamepad id N' above) in the Pad id box");
         return;
     }
 
@@ -347,7 +347,7 @@ static void _debug_win_send_preset(const BYTE *bytes, size_t length)
     int gamepad_id = _debug_win_pick_gamepad();
     if (gamepad_id < 0)
     {
-        debug_log("raw: no gamepad seen yet, type its number in the Pad box");
+        debug_log("raw: no gamepad seen yet, type its id (see 'Gamepad id N' above) in the Pad id box");
         return;
     }
     DWORD error = 0;
@@ -378,7 +378,7 @@ static LRESULT CALLBACK _debug_win_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
                                         WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
                                         0, 0, 0, 0, hwnd, (HMENU)IDC_HEX, inst, NULL);
         SendMessage(debug_hex_edit, WM_SETFONT, (WPARAM)GetStockObject(ANSI_FIXED_FONT), TRUE);
-        debug_pad_label = CreateWindowEx(0, TEXT("STATIC"), TEXT("Pad:"), WS_CHILD | WS_VISIBLE | SS_RIGHT,
+        debug_pad_label = CreateWindowEx(0, TEXT("STATIC"), TEXT("Pad id:"), WS_CHILD | WS_VISIBLE | SS_RIGHT,
                                          0, 0, 0, 0, hwnd, NULL, inst, NULL);
         SendMessage(debug_pad_label, WM_SETFONT, (WPARAM)gui_font, TRUE);
         debug_id_edit = CreateWindowEx(WS_EX_CLIENTEDGE, TEXT("EDIT"), TEXT(""),
@@ -506,7 +506,7 @@ static LRESULT CALLBACK _debug_win_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
                 int gamepad_id = _debug_win_pick_gamepad();
                 if (gamepad_id < 0)
                 {
-                    debug_log("describe: no gamepad seen yet, type its number in the Pad box");
+                    debug_log("describe: no gamepad seen yet, type its id (see 'Gamepad id N' above) in the Pad id box");
                 }
                 else if (!mi_gamepad_describe(gamepad_id))
                 {

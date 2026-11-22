@@ -203,6 +203,11 @@ struct hid_device_info *hid_enumerate(const LPTSTR *path_filters)
                                 break;
                             }
                             dev->instance_path = (LPTSTR)malloc((i - start + 1) * sizeof(TCHAR));
+                            if (dev->instance_path == NULL)
+                            {
+                                hid_free_device_info(dev);
+                                break;
+                            }
                             _tcscpy(dev->instance_path, &dev_id_list_buffer[start]);
                             _hid_fill_symlink_and_desc(dev);
                             _hid_fill_container_path(dev);
@@ -484,6 +489,24 @@ BOOLEAN check_vendor_and_product(struct hid_device_info *device_info, USHORT ven
     }
 }
 
+// Copies src into a new string. A NULL src gives a NULL copy (TRUE); FALSE means out of memory.
+static BOOLEAN _hid_dup_str(LPTSTR *dst, LPCTSTR src)
+{
+    *dst = NULL;
+    if (src == NULL)
+    {
+        return TRUE;
+    }
+    *dst = (LPTSTR)malloc((_tcslen(src) + 1) * sizeof(TCHAR));
+    if (*dst == NULL)
+    {
+        return FALSE;
+    }
+    _tcscpy(*dst, src);
+    return TRUE;
+}
+
+// Returns NULL when out of memory.
 struct hid_device_info *hid_clone_device_info(struct hid_device_info *device_info)
 {
     struct hid_device_info *result = (struct hid_device_info *)calloc(1, sizeof(struct hid_device_info));
@@ -491,25 +514,13 @@ struct hid_device_info *hid_clone_device_info(struct hid_device_info *device_inf
     {
         return NULL;
     }
-    if (device_info->instance_path != NULL)
+    if (!_hid_dup_str(&result->instance_path, device_info->instance_path)
+        || !_hid_dup_str(&result->container_instance_path, device_info->container_instance_path)
+        || !_hid_dup_str(&result->symlink, device_info->symlink)
+        || !_hid_dup_str(&result->description, device_info->description))
     {
-        result->instance_path = (LPTSTR)malloc((_tcslen(device_info->instance_path) + 1) * sizeof(TCHAR));
-        _tcscpy(result->instance_path, device_info->instance_path);
-    }
-    if (device_info->container_instance_path != NULL)
-    {
-        result->container_instance_path = (LPTSTR)malloc((_tcslen(device_info->container_instance_path) + 1) * sizeof(TCHAR));
-        _tcscpy(result->container_instance_path, device_info->container_instance_path);
-    }
-    if (device_info->symlink != NULL)
-    {
-        result->symlink = (LPTSTR)malloc((_tcslen(device_info->symlink) + 1) * sizeof(TCHAR));
-        _tcscpy(result->symlink, device_info->symlink);
-    }
-    if (device_info->description != NULL)
-    {
-        result->description = (LPTSTR)malloc((_tcslen(device_info->description) + 1) * sizeof(TCHAR));
-        _tcscpy(result->description, device_info->description);
+        hid_free_device_info(result);
+        return NULL;
     }
     return result;
 }
@@ -557,21 +568,50 @@ struct hid_device *hid_open_device(struct hid_device_info *device_info, BOOLEAN 
         return NULL;
     }
 
-    struct hid_device *dev = (struct hid_device *)malloc(sizeof(struct hid_device));
-    dev->device_info = hid_clone_device_info(device_info);
-    dev->handle = handle;
-    dev->read_pending = FALSE;
-    dev->input_report_size = caps.InputReportByteLength;
-    dev->output_report_size = caps.OutputReportByteLength;
-    dev->feature_report_size = caps.FeatureReportByteLength;
-    dev->input_buffer = (BYTE *)malloc(caps.InputReportByteLength);
-    dev->output_buffer = (BYTE *)malloc(caps.OutputReportByteLength);
-    dev->feature_buffer = (BYTE *)malloc(caps.FeatureReportByteLength);
+    // a zero-size report still gets a 1 byte buffer, so a NULL always means out of memory
+    USHORT input_size = caps.InputReportByteLength;
+    USHORT output_size = caps.OutputReportByteLength;
+    USHORT feature_size = caps.FeatureReportByteLength;
+    struct hid_device *dev = (struct hid_device *)calloc(1, sizeof(struct hid_device));
+    if (dev != NULL)
+    {
+        dev->device_info = hid_clone_device_info(device_info);
+        dev->input_buffer = (BYTE *)calloc(input_size > 0 ? input_size : 1, 1);
+        dev->output_buffer = (BYTE *)calloc(output_size > 0 ? output_size : 1, 1);
+        dev->feature_buffer = (BYTE *)calloc(feature_size > 0 ? feature_size : 1, 1);
+        dev->input_ol.hEvent = CreateEvent(&security, FALSE, FALSE, NULL);
+    }
 
     HidD_FreePreparsedData(pp_data);
 
-    dev->input_ol = (OVERLAPPED){ 0 };
-    dev->input_ol.hEvent = CreateEvent(&security, FALSE, FALSE, NULL);
+    if (dev == NULL || dev->device_info == NULL || dev->input_buffer == NULL || dev->output_buffer == NULL
+        || dev->feature_buffer == NULL || dev->input_ol.hEvent == NULL)
+    {
+        debug_log("hid_open_device(rw=%d, shared=%d): out of memory", access_rw, shared);
+        if (dev != NULL)
+        {
+            if (dev->input_ol.hEvent != NULL)
+            {
+                CloseHandle(dev->input_ol.hEvent);
+            }
+            if (dev->device_info != NULL)
+            {
+                hid_free_device_info(dev->device_info);
+            }
+            free(dev->input_buffer);
+            free(dev->output_buffer);
+            free(dev->feature_buffer);
+            free(dev);
+        }
+        CloseHandle(handle);
+        return NULL;
+    }
+
+    dev->handle = handle;
+    dev->read_pending = FALSE;
+    dev->input_report_size = input_size;
+    dev->output_report_size = output_size;
+    dev->feature_report_size = feature_size;
 
     return dev;
 }

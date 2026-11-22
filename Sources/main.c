@@ -215,13 +215,55 @@ static void refresh_tray(struct active_device *dev)
     ReleaseSRWLockExclusive(&tray_ui_lock);
 }
 
+// Symlink of the device whose add failed last (worker thread only). A switched-off pad can keep its devnode and
+// fail on every refresh: its failure is shown once, until the device is added or gone.
+static LPTSTR add_failed_symlink = NULL;
+
+static void _add_failed(struct hid_device_info *device_info, LPTSTR text)
+{
+    if (add_failed_symlink != NULL && _tcscmp(add_failed_symlink, device_info->symlink) == 0)
+    {
+        debug_log("add_device: failed again, notification already shown");
+        return;
+    }
+    free(add_failed_symlink);
+    add_failed_symlink = _tcsdup(device_info->symlink);
+    tray_show_notification(NT_TRAY_WARNING, TEXT("Add new device"), text);
+}
+
+// Forgets the failed device when it was added or is not listed any more.
+static void _add_failed_clear_unless(struct hid_device_info *list)
+{
+    if (add_failed_symlink == NULL)
+    {
+        return;
+    }
+    for (struct hid_device_info *cur = list; cur != NULL; cur = cur->next)
+    {
+        if (_tcscmp(add_failed_symlink, cur->symlink) == 0)
+        {
+            return;
+        }
+    }
+    free(add_failed_symlink);
+    add_failed_symlink = NULL;
+}
+
 static BOOLEAN add_device(struct hid_device_info *device_info)
 {
-    if (active_device_count == MAX_ACTIVE_DEVICE_COUNT)
+    // the count and the notified flag are shared with the pad threads (remove_device)
+    AcquireSRWLockExclusive(&active_devices_lock);
+    BOOLEAN limit_reached = active_device_count >= MAX_ACTIVE_DEVICE_COUNT;
+    BOOLEAN notify_limit = limit_reached && !limit_notified;
+    if (notify_limit)
     {
-        if (!limit_notified)
+        limit_notified = TRUE;
+    }
+    ReleaseSRWLockExclusive(&active_devices_lock);
+    if (limit_reached)
+    {
+        if (notify_limit)
         {
-            limit_notified = TRUE;
             tray_show_notification(NT_TRAY_WARNING, TEXT("Add new device"),
                                    TEXT("Device count limit reached"));
         }
@@ -253,32 +295,57 @@ static BOOLEAN add_device(struct hid_device_info *device_info)
 
     if (device == NULL)
     {
-        tray_show_notification(NT_TRAY_WARNING, TEXT("Add new device"),
-                               TEXT("Error opening new device"));
+        _add_failed(device_info, TEXT("Error opening new device"));
         return FALSE;
     }
 
-    int mi_gamepad_id = mi_gamepad_start(device, mi_gamepad_update_cb, mi_gamepad_stop_cb);
-    if (mi_gamepad_id < 0)
+    // everything the pad needs is allocated before its threads start, so an allocation failure has nothing to undo
+    struct active_device *active_device = (struct active_device *)calloc(1, sizeof(struct active_device));
+    if (active_device != NULL)
     {
-        tray_show_notification(NT_TRAY_WARNING, TEXT("Add new device"),
-                               TEXT("Error initializing new device"));
+        active_device->src_device = device;
+        active_device->index = last_active_device_index + 1; // taken over once the pad has started
+        active_device->src_battery_level = -1;
+        active_device->xinput_slot = -1; // learned from the LED notification, the slot is assigned later
+        int tray_text_length = _sctprintf(ACTIVE_DEVICE_MENU_TEMPLATE, _device_number(active_device), BATTERY_NA_TEXT);
+        if (tray_text_length > 0)
+        {
+            active_device->tray_text = (LPTSTR)malloc((tray_text_length + 1) * sizeof(TCHAR));
+        }
+        active_device->tray_menu = (struct tray_menu *)calloc(1, sizeof(struct tray_menu));
+    }
+    if (active_device == NULL || active_device->tray_text == NULL || active_device->tray_menu == NULL)
+    {
+        if (active_device != NULL)
+        {
+            free(active_device->tray_text);
+            free(active_device->tray_menu);
+            free(active_device);
+        }
+        debug_log("add_device: out of memory");
+        _add_failed(device_info, TEXT("Error initializing new device"));
         hid_close_device(device);
         hid_free_device(device);
         return FALSE;
     }
+    _stprintf(active_device->tray_text, ACTIVE_DEVICE_MENU_TEMPLATE, _device_number(active_device), BATTERY_NA_TEXT);
+    active_device->tray_menu->text = active_device->tray_text;
+    active_device->tray_menu->cb = pad_menu_cb;
 
-    struct active_device *active_device = (struct active_device *)malloc(sizeof(struct active_device));
-    active_device->src_device = device;
-    active_device->index = ++last_active_device_index;
+    int mi_gamepad_id = mi_gamepad_start(device, mi_gamepad_update_cb, mi_gamepad_stop_cb);
+    if (mi_gamepad_id < 0)
+    {
+        _add_failed(device_info, TEXT("Error initializing new device"));
+        free(active_device->tray_text);
+        free(active_device->tray_menu);
+        free(active_device);
+        hid_close_device(device);
+        hid_free_device(device);
+        return FALSE;
+    }
+    last_active_device_index = active_device->index;
     active_device->src_gamepad_id = mi_gamepad_id;
-    active_device->src_battery_level = -1;
-    active_device->xinput_slot = -1; // learned from the LED notification, the slot is assigned later
-    active_device->tray_text = NULL;
-    active_device->tray_menu = NULL;
-    active_device->tgt_device = NULL;
-    active_device->tgt_added = FALSE;
-    _mem_zero(&active_device->tgt_report, sizeof(active_device->tgt_report));
+    active_device->tray_menu->context = (void *)(INT_PTR)mi_gamepad_id;
     if (vigem_connected)
     {
         AcquireSRWLockExclusive(&vigem_lock);
@@ -299,18 +366,17 @@ static BOOLEAN add_device(struct hid_device_info *device_info)
         }
         ReleaseSRWLockExclusive(&vigem_lock);
     }
-    int tray_text_length = _sctprintf(ACTIVE_DEVICE_MENU_TEMPLATE, _device_number(active_device), BATTERY_NA_TEXT);
-    active_device->tray_text = (LPTSTR)malloc((tray_text_length + 1) * sizeof(TCHAR));
-    _stprintf(active_device->tray_text, ACTIVE_DEVICE_MENU_TEMPLATE, _device_number(active_device), BATTERY_NA_TEXT);
-    active_device->tray_menu = (struct tray_menu *)calloc(1, sizeof(struct tray_menu));
-    active_device->tray_menu->text = active_device->tray_text;
-    active_device->tray_menu->cb = pad_menu_cb;
-    active_device->tray_menu->context = (void *)(INT_PTR)mi_gamepad_id;
     active_device->hid_hidden = hid_hide_bind(device->device_info) == HID_HIDE_RESULT_OK;
 
     AcquireSRWLockExclusive(&active_devices_lock);
     active_devices[active_device_count++] = active_device;
     ReleaseSRWLockExclusive(&active_devices_lock);
+
+    if (add_failed_symlink != NULL && _tcscmp(add_failed_symlink, device_info->symlink) == 0)
+    {
+        free(add_failed_symlink);
+        add_failed_symlink = NULL;
+    }
 
     refresh_tray(NULL);
     if (active_device->tgt_added)
@@ -332,32 +398,50 @@ static BOOLEAN add_device(struct hid_device_info *device_info)
 static BOOLEAN remove_device(int mi_gamepad_id)
 {
     debug_log("remove_device: gamepad %d", mi_gamepad_id);
-    BOOLEAN removed = FALSE;
-    PVIGEM_TARGET tgt_device = NULL;
-    BOOLEAN tgt_added = FALSE;
-    AcquireSRWLockExclusive(&active_devices_lock);
+    struct active_device *dev = NULL;
+    AcquireSRWLockShared(&active_devices_lock);
     for (int i = 0; i < active_device_count; i++)
     {
         if (active_devices[i]->src_gamepad_id == mi_gamepad_id)
         {
-            if (active_devices[i]->hid_hidden)
+            dev = active_devices[i];
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&active_devices_lock);
+    if (dev == NULL)
+    {
+        return FALSE;
+    }
+
+    // The ViGEm target goes first: unregistering waits for the notification callback, which uses dev and takes
+    // tray_ui_lock, so no lock may be held here.
+    PVIGEM_TARGET tgt_device = dev->tgt_device;
+    BOOLEAN tgt_added = dev->tgt_added;
+    dev->tgt_device = NULL;
+    dev->tgt_added = FALSE;
+    vigem_release_target(tgt_device, tgt_added);
+
+    // lock order: tray_ui_lock, then active_devices_lock (like refresh_tray); a menu rebuild may still read the texts
+    BOOLEAN removed = FALSE;
+    AcquireSRWLockExclusive(&tray_ui_lock);
+    AcquireSRWLockExclusive(&active_devices_lock);
+    for (int i = 0; i < active_device_count; i++)
+    {
+        if (active_devices[i] == dev)
+        {
+            if (dev->hid_hidden)
             {
-                hid_hide_unbind(active_devices[i]->src_device->device_info);
+                hid_hide_unbind(dev->src_device->device_info);
             }
-            hid_close_device(active_devices[i]->src_device);
-            hid_free_device(active_devices[i]->src_device);
-            // the ViGEm target is released after the lock is dropped
-            tgt_device = active_devices[i]->tgt_device;
-            tgt_added = active_devices[i]->tgt_added;
-            free(active_devices[i]->tray_menu);
-            free(active_devices[i]->tray_text);
-            free(active_devices[i]);
-            if (i < active_device_count - 1)
+            hid_close_device(dev->src_device);
+            hid_free_device(dev->src_device);
+            free(dev->tray_menu);
+            free(dev->tray_text);
+            free(dev);
+            for (int j = i; j < active_device_count - 1; j++)
             {
-                for (int j = i; j < active_device_count - 1; j++)
-                {
-                    active_devices[j] = active_devices[j + 1];
-                }
+                active_devices[j] = active_devices[j + 1];
             }
             active_device_count--;
             limit_notified = FALSE;
@@ -367,7 +451,7 @@ static BOOLEAN remove_device(int mi_gamepad_id)
         }
     }
     ReleaseSRWLockExclusive(&active_devices_lock);
-    vigem_release_target(tgt_device, tgt_added);
+    ReleaseSRWLockExclusive(&tray_ui_lock);
     return removed;
 }
 
@@ -378,6 +462,7 @@ static void refresh_devices()
     struct hid_device_info *device_info = hid_enumerate(mi_hw_path_filters);
     struct hid_device_info *cur;
     BOOLEAN found = FALSE;
+    _add_failed_clear_unless(device_info);
 
     // remove missing devices
     AcquireSRWLockShared(&active_devices_lock);
@@ -432,16 +517,9 @@ static void refresh_devices()
     }
 }
 
-// Removes all virtual pads and turns the real pads off (disables and re-enables their parent devnode).
-// Nothing is added back: the pads come back through the normal refresh when they are switched on again.
-static void reset_devices()
+// Asks every pad to stop and waits (bounded) until all of them are removed.
+static void stop_all_devices()
 {
-    InterlockedExchange(&reattaching, 1);
-
-    // find the real pads first (also ones that are not active), they are gone from the list after stopping
-    LPTSTR mi_hw_path_filters[3] = { MI_HW_FILTER_WIN10, MI_HW_FILTER_WIN7, NULL };
-    struct hid_device_info *device_info = hid_enumerate(mi_hw_path_filters);
-
     AcquireSRWLockShared(&active_devices_lock);
     for (int i = 0; i < active_device_count; i++)
     {
@@ -449,7 +527,6 @@ static void reset_devices()
     }
     ReleaseSRWLockShared(&active_devices_lock);
 
-    // wait until all of them are removed
     ULONGLONG deadline = GetTickCount64() + REATTACH_REMOVE_TIMEOUT_MS;
     AcquireSRWLockShared(&active_devices_lock);
     while (active_device_count > 0)
@@ -463,6 +540,19 @@ static void reset_devices()
         }
     }
     ReleaseSRWLockShared(&active_devices_lock);
+}
+
+// Removes all virtual pads and turns the real pads off (disables and re-enables their parent devnode).
+// Nothing is added back: the pads come back through the normal refresh when they are switched on again.
+static void reset_devices()
+{
+    InterlockedExchange(&reattaching, 1);
+
+    // find the real pads first (also ones that are not active), they are gone from the list after stopping
+    LPTSTR mi_hw_path_filters[3] = { MI_HW_FILTER_WIN10, MI_HW_FILTER_WIN7, NULL };
+    struct hid_device_info *device_info = hid_enumerate(mi_hw_path_filters);
+
+    stop_all_devices();
     last_active_device_index = 0;
 
     // turn the real pads off, once per parent devnode (a pad can expose several HID interfaces)
@@ -773,44 +863,39 @@ int main(int argc, char **argv)
     CloseHandle(refresh_thread);
     CloseHandle(refresh_event);
 
-    PVIGEM_TARGET exit_targets[MAX_ACTIVE_DEVICE_COUNT];
-    BOOLEAN exit_added[MAX_ACTIVE_DEVICE_COUNT];
-    int exit_count = 0;
-    AcquireSRWLockExclusive(&active_devices_lock);
+    // stop the pads first: their threads call back into this file and into ViGEm
+    stop_all_devices();
+    BOOLEAN pads_left = FALSE;
+    AcquireSRWLockShared(&active_devices_lock);
+    pads_left = active_device_count > 0;
     for (int i = 0; i < active_device_count; i++)
     {
         if (active_devices[i]->hid_hidden)
         {
             hid_hide_unbind(active_devices[i]->src_device->device_info);
         }
-        hid_close_device(active_devices[i]->src_device);
-        hid_free_device(active_devices[i]->src_device);
-        exit_targets[exit_count] = active_devices[i]->tgt_device;
-        exit_added[exit_count] = active_devices[i]->tgt_added;
-        exit_count++;
-        free(active_devices[i]->tray_menu);
-        free(active_devices[i]->tray_text);
-        free(active_devices[i]);
     }
-    active_device_count = 0;
-    ReleaseSRWLockExclusive(&active_devices_lock);
-    for (int i = 0; i < exit_count; i++)
+    ReleaseSRWLockShared(&active_devices_lock);
+    if (!pads_left)
     {
-        vigem_release_target(exit_targets[i], exit_added[i]);
+        // a pad that did not stop in time keeps using ViGEm: skip the teardown, the process ends anyway
+        AcquireSRWLockExclusive(&vigem_lock);
+        if (vigem_connected)
+        {
+            vigem_disconnect(vigem_client);
+        }
+        vigem_free(vigem_client);
+        ReleaseSRWLockExclusive(&vigem_lock);
     }
-    AcquireSRWLockExclusive(&vigem_lock);
-    if (vigem_connected)
-    {
-        vigem_disconnect(vigem_client);
-    }
-    vigem_free(vigem_client);
-    ReleaseSRWLockExclusive(&vigem_lock);
     if (hid_hide_connected)
     {
         hid_hide_free();
     }
     mi_set_raw_cb(NULL);
     debug_win_free();
-    free(tray.menu);
+    if (!pads_left)
+    {
+        free(tray.menu);
+    }
     return 0;
 }

@@ -1,3 +1,4 @@
+#include <stdlib.h>
 #include <tchar.h>
 #include <windows.h>
 #include <shellapi.h>
@@ -9,17 +10,56 @@
 #pragma comment(lib, "shell32.lib")
 
 #define WM_TRAY_CALLBACK_MESSAGE (WM_USER + 1)
+// a freshly built menu handed over by tray_update (lparam = struct menu_bundle *)
+#define WM_TRAY_SWAP (WM_USER + 2)
 #define WC_TRAY_CLASS_NAME TEXT("MiViGEmClass")
 #define WC_TRAY_MUTEX_NAME TEXT("MI-VIGEM")
 #define ID_TRAY_FIRST 1000
 
+// A menu item is copied when the menu is built, so the caller's item array may be freed right after tray_update.
+struct menu_copy
+{
+    struct tray_menu item;
+    struct menu_copy *next;
+};
+
+struct menu_bundle
+{
+    HMENU hmenu;
+    struct menu_copy *copies;
+};
+
 static WNDCLASSEX wc;
 static NOTIFYICONDATA nid;
 static HWND hwnd = NULL;
-static HMENU hmenu = NULL;
+// tray thread only: the menu in use, a newer one waiting for the open popup to close, and the popup state
+static struct menu_bundle *cur_menu = NULL;
+static struct menu_bundle *pending_menu = NULL;
+static BOOLEAN popup_open = FALSE;
 static HANDLE hmutex;
+// guards nid and hwnd between tray_show_notification (any thread) and tray_exit
+static SRWLOCK nid_lock = SRWLOCK_INIT;
 static HDEVNOTIFY hdevntf;
 static void (*devntf_cb)(UINT op, LPTSTR path) = NULL;
+
+static void _tray_free_bundle(struct menu_bundle *bundle)
+{
+    if (bundle == NULL)
+    {
+        return;
+    }
+    if (bundle->hmenu != NULL)
+    {
+        DestroyMenu(bundle->hmenu);
+    }
+    while (bundle->copies != NULL)
+    {
+        struct menu_copy *next = bundle->copies->next;
+        free(bundle->copies);
+        bundle->copies = next;
+    }
+    free(bundle);
+}
 
 static LRESULT CALLBACK _tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
@@ -36,35 +76,59 @@ static LRESULT CALLBACK _tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARA
         PostQuitMessage(0);
         return 0;
     case WM_TRAY_CALLBACK_MESSAGE:
-        if (lparam == WM_LBUTTONUP || lparam == WM_RBUTTONUP)
+        if ((lparam == WM_LBUTTONUP || lparam == WM_RBUTTONUP) && cur_menu != NULL && !popup_open)
         {
             POINT p;
             GetCursorPos(&p);
             SetForegroundWindow(hwnd);
-            WORD cmd = TrackPopupMenu(hmenu, TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+            struct menu_bundle *shown = cur_menu;
+            popup_open = TRUE;
+            UINT cmd = TrackPopupMenu(shown->hmenu, TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
                                       p.x, p.y, 0, hwnd, NULL);
-            SendMessage(hwnd, WM_COMMAND, cmd, 0);
-            return 0;
-        }
-        break;
-    case WM_COMMAND:
-        if (wparam >= ID_TRAY_FIRST)
-        {
-            MENUITEMINFO item = {
-                .cbSize = sizeof(MENUITEMINFO),
-                .fMask = MIIM_ID | MIIM_DATA,
-            };
-            if (GetMenuItemInfo(hmenu, wparam, FALSE, &item))
+            // resolve the click in the menu that was shown (a rebuilt menu has other command IDs)
+            struct tray_menu picked = { 0 };
+            BOOLEAN has_pick = FALSE;
+            if (cmd >= ID_TRAY_FIRST)
             {
-                struct tray_menu *menu = (struct tray_menu *)item.dwItemData;
-                if (menu != NULL && menu->cb != NULL)
+                MENUITEMINFO item = {
+                    .cbSize = sizeof(MENUITEMINFO),
+                    .fMask = MIIM_DATA,
+                };
+                if (GetMenuItemInfo(shown->hmenu, cmd, FALSE, &item) && item.dwItemData != 0)
                 {
-                    menu->cb(menu);
+                    picked = *(struct tray_menu *)item.dwItemData;
+                    has_pick = TRUE;
                 }
+            }
+            popup_open = FALSE;
+            // without this the menu may stay open after a click outside of it
+            PostMessage(hwnd, WM_NULL, 0, 0);
+            if (pending_menu != NULL)
+            {
+                _tray_free_bundle(cur_menu);
+                cur_menu = pending_menu;
+                pending_menu = NULL;
+            }
+            if (has_pick && picked.cb != NULL)
+            {
+                picked.cb(&picked);
             }
             return 0;
         }
         break;
+    case WM_TRAY_SWAP:
+        if (popup_open)
+        {
+            // the popup is still showing the old menu, it must not be destroyed under the user
+            _tray_free_bundle(pending_menu);
+            pending_menu = (struct menu_bundle *)lparam;
+        }
+        else
+        {
+            _tray_free_bundle(cur_menu);
+            cur_menu = (struct menu_bundle *)lparam;
+        }
+        return 0;
     case WM_DEVICECHANGE:
         if (devntf_cb != NULL)
         {
@@ -81,6 +145,11 @@ static LRESULT CALLBACK _tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARA
             LPTSTR path = NULL;
             if (lparam != 0)
             {
+                // other broadcasts (volumes, ports, ...) carry a different structure: ignore them
+                if (((PDEV_BROADCAST_HDR)lparam)->dbch_devicetype != DBT_DEVTYP_DEVICEINTERFACE)
+                {
+                    break;
+                }
                 PDEV_BROADCAST_DEVICEINTERFACE bdi = (PDEV_BROADCAST_DEVICEINTERFACE)lparam;
                 path = bdi->dbcc_name;
             }
@@ -91,14 +160,14 @@ static LRESULT CALLBACK _tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARA
     return DefWindowProc(hwnd, msg, wparam, lparam);
 }
 
-static HMENU _tray_menu(struct tray_menu *m, UINT *id)
+static HMENU _tray_menu(struct tray_menu *m, UINT *id, struct menu_copy **copies)
 {
-    HMENU hmenu = CreatePopupMenu();
+    HMENU menu = CreatePopupMenu();
     for (; m != NULL && m->text != NULL; m++, (*id)++)
     {
         if (_tcscmp(m->text, TEXT("-")) == 0)
         {
-            InsertMenu(hmenu, *id, MF_SEPARATOR, TRUE, TEXT(""));
+            InsertMenu(menu, *id, MF_SEPARATOR, TRUE, TEXT(""));
         }
         else
         {
@@ -111,7 +180,7 @@ static HMENU _tray_menu(struct tray_menu *m, UINT *id)
             if (m->submenu != NULL)
             {
                 item.fMask = item.fMask | MIIM_SUBMENU;
-                item.hSubMenu = _tray_menu(m->submenu, id);
+                item.hSubMenu = _tray_menu(m->submenu, id, copies);
             }
             if (m->disabled)
             {
@@ -123,12 +192,20 @@ static HMENU _tray_menu(struct tray_menu *m, UINT *id)
             }
             item.wID = *id;
             item.dwTypeData = m->text;
-            item.dwItemData = (ULONG_PTR)m;
+            struct menu_copy *copy = (struct menu_copy *)malloc(sizeof(struct menu_copy));
+            if (copy != NULL)
+            {
+                copy->item = *m;
+                copy->item.text = NULL; // the text pointer would dangle, the menu keeps its own copy
+                copy->next = *copies;
+                *copies = copy;
+                item.dwItemData = (ULONG_PTR)&copy->item;
+            }
 
-            InsertMenuItem(hmenu, *id, TRUE, &item);
+            InsertMenuItem(menu, *id, TRUE, &item);
         }
     }
-    return hmenu;
+    return menu;
 }
 
 int tray_init(struct tray *tray)
@@ -169,6 +246,8 @@ int tray_init(struct tray *tray)
     nid.uID = 0;
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAY_CALLBACK_MESSAGE;
+    nid.hIcon = LoadIcon(wc.hInstance, tray->icon);
+    lstrcpyn(nid.szTip, tray->tip, ARRAYSIZE(nid.szTip));
     Shell_NotifyIcon(NIM_ADD, &nid);
 
     tray_update(tray);
@@ -199,39 +278,43 @@ int tray_loop(BOOLEAN blocking)
     return 0;
 }
 
+// Callable from any thread: the menu is built here from tray->menu (which the caller may free afterwards)
+// and handed to the tray thread, which swaps it in. Never blocks on the tray thread.
 void tray_update(struct tray *tray)
 {
-    HMENU prevmenu = hmenu;
-    UINT id = ID_TRAY_FIRST;
-    hmenu = _tray_menu(tray->menu, &id);
-    HICON hicon = LoadIcon(wc.hInstance, tray->icon);
-    if (nid.hIcon)
+    HWND target = hwnd;
+    if (target == NULL)
     {
-        DestroyIcon(nid.hIcon);
+        return;
     }
-    nid.hIcon = hicon;
-    _tcscpy(nid.szTip, tray->tip);
-    Shell_NotifyIcon(NIM_MODIFY, &nid);
-
-    if (prevmenu != NULL)
+    struct menu_bundle *bundle = (struct menu_bundle *)calloc(1, sizeof(struct menu_bundle));
+    if (bundle == NULL)
     {
-        DestroyMenu(prevmenu);
+        return;
+    }
+    UINT id = ID_TRAY_FIRST;
+    bundle->hmenu = _tray_menu(tray->menu, &id, &bundle->copies);
+    if (!PostMessage(target, WM_TRAY_SWAP, 0, (LPARAM)bundle))
+    {
+        _tray_free_bundle(bundle);
     }
 }
 
 void tray_exit()
 {
+    AcquireSRWLockExclusive(&nid_lock);
     Shell_NotifyIcon(NIM_DELETE, &nid);
+    hwnd = NULL;
+    ReleaseSRWLockExclusive(&nid_lock);
     if (nid.hIcon != 0)
     {
         DestroyIcon(nid.hIcon);
     }
-    if (hmenu != 0)
-    {
-        DestroyMenu(hmenu);
-    }
+    _tray_free_bundle(cur_menu);
+    cur_menu = NULL;
+    _tray_free_bundle(pending_menu);
+    pending_menu = NULL;
     PostQuitMessage(0);
-    hwnd = NULL;
     UnregisterClass(WC_TRAY_CLASS_NAME, GetModuleHandle(NULL));
     ReleaseMutex(hmutex);
     CloseHandle(hmutex);
@@ -259,16 +342,20 @@ void tray_register_device_notification(GUID filter, void (*cb)(UINT, LPTSTR))
 
 void tray_show_notification(UINT type, LPTSTR title, LPTSTR text)
 {
-    if (hwnd == NULL)
+    // copy nid under the lock (tray_exit changes it), bounded: title and text may be longer than the fields
+    NOTIFYICONDATA nid_info;
+    AcquireSRWLockShared(&nid_lock);
+    BOOLEAN have_icon = hwnd != NULL;
+    nid_info = nid;
+    ReleaseSRWLockShared(&nid_lock);
+    if (!have_icon)
     {
         return;
     }
 
-    NOTIFYICONDATA nid_info;
-    nid_info = nid;
     nid_info.uFlags |= NIF_INFO;
-    _tcscpy(nid_info.szInfoTitle, title);
-    _tcscpy(nid_info.szInfo, text);
+    lstrcpyn(nid_info.szInfoTitle, title != NULL ? title : TEXT(""), ARRAYSIZE(nid_info.szInfoTitle));
+    lstrcpyn(nid_info.szInfo, text != NULL ? text : TEXT(""), ARRAYSIZE(nid_info.szInfo));
     switch (type)
     {
     case NT_TRAY_INFO:

@@ -1,10 +1,8 @@
-#include <ctype.h>
 #include <stddef.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <tchar.h>
-#include <wctype.h>
 #include <windows.h>
 
 #include "utils.h"

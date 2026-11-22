@@ -14,8 +14,8 @@ Durable project choices, deduced from the code. Follow them; fix a line when a s
 - Only the Xiaomi Gamepad (VID 0x2717, PID 0x3144) is supported; matched by substring on the HID instance ID (Win10+ `VID&00022717_PID&3144`, Win7 `VID_2717&PID_3144`).
 - Max 4 simultaneous devices (`MAX_ACTIVE_DEVICE_COUNT`); extra ones are rejected with a tray warning.
 - Each device is emulated as a ViGEm Xbox 360 pad; Xiaomi button -> `GUIDE`, Return -> `BACK`, Menu -> `START`.
-- Input packets are accepted only with header `0x04`; sticks are bytes centered at 128, Y axes are inverted.
-- The Mi button is reported as a 200 ms pulse (held/released by a delay thread).
+- Input packets are accepted only with header `0x04` and at least 21 bytes; sticks are bytes centered at 128, Y axes are inverted.
+- The Mi button is reported as a 200 ms pulse (held/released by a delay thread), started by a new press only (rising edge of byte 20), not by a held button.
 - Accelerometer and battery are parsed; only battery is used (tray menu text). Accel is not forwarded.
 - Rumble: X360 large/small motor map to Xiaomi big/small (swapped in the callback), sent as feature report `0x20`.
 
@@ -23,7 +23,10 @@ Durable project choices, deduced from the code. Follow them; fix a line when a s
 - Per gamepad (`mi.c`): one input thread, one output (vibration) thread, one delay thread, stopped via `stopping_event`; input thread cleans everything up and calls `stop_cb` last.
 - `active_devices` is guarded by an SRW lock; removals signal a condition variable.
 - Device refreshes run on a single worker thread; the tray thread only sets an event. Requests are coalesced; a reset (`Reset Gamepads`) wins over a normal refresh.
-- Tray UI calls come from the worker/input threads directly (notifications); menu text, menu array and `tray_update` changes go through `refresh_tray` (`tray_ui_lock`, serialized). `tray_update` does no cross-thread `SendMessage` (it would deadlock with that lock).
+- Tray UI calls come from the worker/input threads directly (notifications); menu text, menu array and `tray_update` changes go through `refresh_tray` (`tray_ui_lock`, serialized). `tray_update` builds the HMENU on the calling thread and posts it to the tray thread (`WM_TRAY_SWAP`, never `SendMessage`: it would deadlock with that lock); `tray.c` copies every item, so the caller's menu array can be freed right after the call. The tray thread keeps the shown menu until the popup closes (a newer one waits) and resolves the click in the menu that was shown.
+- Lock order: `tray_ui_lock`, then `active_devices_lock`. `remove_device` releases the ViGEm target first (its notification callback uses the device), then frees the device under both locks.
+- `upd_cb` runs under the pad's `state_lock`: the input and delay thread callbacks are serialized and reach the virtual pad in order; the state pointer must not be kept.
+- On quit all pads are stopped and awaited (`stop_all_devices`) before ViGEm/HidHide teardown; if one does not stop in time the teardown is skipped.
 - ViGEm (`vigem_*`) is NOT thread safe: after startup every call runs under `vigem_lock` (`vigem_release_target` for teardown), and never under `tray_ui_lock` or `active_devices_lock` (unregistering a notification can wait for its callback, which takes both); `remove_device` releases the target after dropping its lock.
 
 ## Behavior (fork features)
@@ -36,19 +39,22 @@ Durable project choices, deduced from the code. Follow them; fix a line when a s
 - Win11 keeps the HID devnode and the pending read after the pad powers off (Win10 failed the read), so the input thread probes with a feature report `0x20` (current motor values, private buffer) after 300 silent 1 s read timeouts (the pad's idle shutdown is 300 s; earlier probing might keep it awake); a failed probe ends the pad (write error). A manual power-off (Mi button held ~3-4 s) sends one last blank (neutral) report and then goes silent, with no Mi "released" report. So after a blank report the probe runs once after 2 silent 1 s timeouts; the 5 min auto-off sends no blank report and keeps the 300 s probe. The virtual Mi (GUIDE) press is a fixed 200 ms pulse, so it never sticks.
 - Rumble retries a failed command every 50 ms until it works (no timed safety stop); on stop, vibration-off is retried up to 20 times.
 - If ViGEmBus is missing/incompatible, or adding a pad's target fails, the app still runs and lists devices, with an error/warning notification; only pads with `tgt_added` are emulated or removed from the bus.
-- The "device count limit" warning is shown once until a pad is removed.
+- The "device count limit" warning is shown once until a pad is removed (flag and count are read under `active_devices_lock`).
+- An add failure (open or init error, e.g. a switched-off pad whose devnode lingers) is notified once per device symlink; it is forgotten when that device is added or no longer enumerated (worker thread only).
+- All memory of a new pad (`active_device`, menu text, menu item) is allocated before its threads start; a failed `mi_gamepad_start` frees its events and terminates the never-run suspended threads.
 
 ## HidHide
 - Optional: if the driver is missing, the app works without hiding. Same if our exe's NT path cannot be resolved: init fails (error notification) and nothing is hidden, since we could not whitelist ourselves.
-- On init: whitelist our exe (NT device path) unless HidHide is in inverse mode (then remove it), and activate HidHide.
-- Per device: add instance path and its parent (container) path to the blacklist; remove both on unbind.
-- On exit: restore HidHide's initial active state; the blacklist/whitelist entries we added are not otherwise restored besides per-device unbind.
+- On init: whitelist our exe (NT device path) unless HidHide is in inverse mode (then remove it), and activate HidHide. A list that cannot be read, or a failed list write/activation at init, aborts init (nothing hidden, error notification) so the user's lists are never overwritten from an empty copy; `bind` rolls back if the blacklist write fails. `hh_lock` guards the HidHide state (bind runs on the worker, unbind on pad threads).
+- Per device: add instance path and its parent (container) path to the blacklist (the parent only if not listed yet); remove both on unbind, but keep the parent while another bound interface of the same parent exists (`bound` list in `hid_hide.c`). Paths and instance IDs are compared case-insensitively.
+- On exit: restore HidHide's initial active state and remove the whitelist entry we added for our exe (only if we added it; an existing entry stays). Blacklist entries are removed by per-device unbind.
+- A crash leaves the pads in the blacklist and our whitelist entry: accepted. It heals itself on the next run (bind finds the entry, unbind removes it); no cleanup at init, because an entry for the pad could be the user's own.
 
 ## UI
 - Tray icon only: menu lists `#N Xiaomi Gamepad (batt. X%)` items (N = XInput slot + 1, taken from the X360 LED number in the ViGEm notification because the slot is assigned after the target is added; until then our own running index, clicking one vibrates that pad for 500 ms), a separator, `Reset Gamepads`, (`Debug`, debug builds only), a separator, `Autostart at Logon` (checked), `GitHub Page`, a separator, `Quit  (ver. x.y.z)`.
 - Autostart = HKCU `...\Run` value `My-ViGEm` holding the quoted exe path (`autostart.c`); enabled only if the stored path equals the running exe. State is cached in `autostart_checked`.
 - Menu is rebuilt from `active_devices` (`rebuild_tray_menu`) then applied with `tray_update`.
-- Notifications are balloon tips (10 s), levels info/warning/error.
+- Notifications are balloon tips (10 s), levels info/warning/error; title and text are copied bounded into `nid` (copied under `nid_lock`).
 - Tray menu uses `-` text as a separator and a `NULL` text terminator.
 
 ## Debug / docs
@@ -57,5 +63,5 @@ Durable project choices, deduced from the code. Follow them; fix a line when a s
 - It shows raw report bytes, the report decoded per `PROTOCOL.md` (unknown bits/bytes are listed), and the event log. The decoder in `debug_win.c` is independent of `mi.c` on purpose, so it shows what the hardware sends, not what the app assumes.
 - All `debug_log` output goes to the console (`--debug`) and to the window; use it for anything worth seeing there.
 - The raw report hook (`mi_set_raw_cb`) runs on the input thread: keep it cheap, no blocking.
-- Raw probing (hex box + `Send feature` / `Send output` / `Get feature`) targets the Pad id typed in the box, or the first gamepad seen reporting. Every raw call is logged with its result and Win32 error. Report `0x22` (calibration, permanent on the pad) asks for confirmation before sending.
+- Raw probing (hex box + `Send feature` / `Send output` / `Get feature`) targets the internal gamepad id typed in the `Pad id` box (shown as `Gamepad id N` in the dump; the tray shows the XInput slot instead, accepted), or the first gamepad seen reporting. Every raw call is logged with its result and Win32 error. Report `0x22` (calibration, permanent on the pad) asks for confirmation before sending.
 - Preset buttons: `Input off/on` (`0x23`; off asks for confirmation) and `Accel on/off` (`0x31`, sensitivity from a hex box, default 08 like the old unused `enable_accel` constant).
