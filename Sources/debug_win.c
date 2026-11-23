@@ -18,9 +18,16 @@
 #define DEBUG_WIN_MAX_SLOTS 8
 #define DEBUG_WIN_MAX_REPORT 64
 #define DEBUG_WIN_LIVE_HEIGHT 260
-#define DEBUG_WIN_ROW_HEIGHT 32
-#define DEBUG_WIN_TOOLBAR_HEIGHT (2 * DEBUG_WIN_ROW_HEIGHT)
-#define DEBUG_WIN_BUTTON_WIDTH 105
+// layout (pixels)
+#define DBG_MARGIN 8
+#define DBG_ROW 26
+#define DBG_GAP 6
+#define DBG_CAPTION 18
+#define DBG_LABEL_WIDTH 64
+#define DBG_RAW_BUTTON_WIDTH 104
+#define DBG_PRESET_BUTTON_WIDTH 118
+#define DBG_MIN_WIDTH 700
+#define DBG_MIN_HEIGHT 500
 
 #define IDC_HEX 101
 #define IDC_PAD 102
@@ -33,6 +40,7 @@
 #define IDC_ACCEL_OFF 109
 #define IDC_SENS 110
 #define IDC_HID_INFO 111
+#define IDC_IDENTIFY 112
 #define DEBUG_WIN_SLOT_TEXT 1200
 #define DEBUG_WIN_TIMER_ID 1
 #define DEBUG_WIN_TIMER_MS 100
@@ -53,13 +61,21 @@ static HANDLE debug_thread = NULL;
 static HANDLE debug_ready_event = NULL;
 static HWND debug_live_edit = NULL;
 static HWND debug_hex_edit = NULL;
-static HWND debug_id_edit = NULL;
+static HWND debug_pad_combo = NULL;
 static HWND debug_pad_label = NULL;
+static HWND debug_hex_label = NULL;
+static HWND debug_identify_button = NULL;
 static HWND debug_raw_buttons[3];
 static HWND debug_preset_buttons[4];
 static HWND debug_info_button = NULL;
 static HWND debug_sens_label = NULL;
 static HWND debug_sens_edit = NULL;
+static HWND debug_separator = NULL;
+static HWND debug_live_caption = NULL;
+static HWND debug_log_caption = NULL;
+// fonts made by the window thread (NULL: the stock font is used)
+static HFONT debug_ui_font = NULL;
+static HFONT debug_mono_font = NULL;
 
 static struct report_slot report_slots[DEBUG_WIN_MAX_SLOTS];
 static SRWLOCK report_lock = SRWLOCK_INIT;
@@ -225,28 +241,70 @@ static void _debug_win_refresh_live(void)
     SetWindowText(debug_live_edit, text);
 }
 
-// Internal gamepad id typed in the Pad id box (the tray shows the XInput slot instead), or the first gamepad seen sending reports. -1 if none.
+// Id of the gamepad selected in the Pad dropdown (internal id; the tray shows the XInput slot). -1 if none.
 static int _debug_win_pick_gamepad(void)
 {
-    TCHAR id_text[16];
-    GetWindowText(debug_id_edit, id_text, sizeof(id_text) / sizeof(id_text[0]));
-    if (id_text[0] != TEXT('\0'))
+    LRESULT selected = SendMessage(debug_pad_combo, CB_GETCURSEL, 0, 0);
+    if (selected == CB_ERR)
     {
-        return _ttoi(id_text);
+        return -1;
+    }
+    return (int)SendMessage(debug_pad_combo, CB_GETITEMDATA, (WPARAM)selected, 0);
+}
+
+// Keeps the Pad dropdown equal to the live gamepads, so only existing pads can be picked. The selection stays on
+// the same pad when it is still there. The pad dependent controls are disabled while there is no pad.
+static void _debug_win_refresh_pads(void)
+{
+    if (debug_pad_combo == NULL || SendMessage(debug_pad_combo, CB_GETDROPPEDSTATE, 0, 0))
+    {
+        return;
     }
 
-    int gamepad_id = -1;
-    AcquireSRWLockShared(&report_lock);
-    for (int i = 0; i < DEBUG_WIN_MAX_SLOTS; i++)
+    int ids[DEBUG_WIN_MAX_SLOTS];
+    int count = mi_gamepad_list(ids, DEBUG_WIN_MAX_SLOTS);
+
+    BOOLEAN same = (int)SendMessage(debug_pad_combo, CB_GETCOUNT, 0, 0) == count;
+    for (int i = 0; i < count && same; i++)
     {
-        if (report_slots[i].used)
+        same = (int)SendMessage(debug_pad_combo, CB_GETITEMDATA, (WPARAM)i, 0) == ids[i];
+    }
+    if (same)
+    {
+        return;
+    }
+
+    int selected_id = _debug_win_pick_gamepad();
+    int select = 0;
+    SendMessage(debug_pad_combo, CB_RESETCONTENT, 0, 0);
+    for (int i = 0; i < count; i++)
+    {
+        TCHAR label[32];
+        _stprintf(label, TEXT("Gamepad id %d"), ids[i]);
+        LRESULT index = SendMessage(debug_pad_combo, CB_ADDSTRING, 0, (LPARAM)label);
+        SendMessage(debug_pad_combo, CB_SETITEMDATA, (WPARAM)index, (LPARAM)ids[i]);
+        if (ids[i] == selected_id)
         {
-            gamepad_id = report_slots[i].gamepad_id;
-            break;
+            select = (int)index;
         }
     }
-    ReleaseSRWLockShared(&report_lock);
-    return gamepad_id;
+    if (count > 0)
+    {
+        SendMessage(debug_pad_combo, CB_SETCURSEL, (WPARAM)select, 0);
+    }
+
+    BOOL enable = count > 0;
+    EnableWindow(debug_pad_combo, enable);
+    EnableWindow(debug_identify_button, enable);
+    EnableWindow(debug_info_button, enable);
+    for (int i = 0; i < 3; i++)
+    {
+        EnableWindow(debug_raw_buttons[i], enable);
+    }
+    for (int i = 0; i < 4; i++)
+    {
+        EnableWindow(debug_preset_buttons[i], enable);
+    }
 }
 
 static void _debug_win_do_raw(BYTE kind)
@@ -333,7 +391,7 @@ static void _debug_win_do_raw(BYTE kind)
     int gamepad_id = _debug_win_pick_gamepad();
     if (gamepad_id < 0)
     {
-        debug_log("raw: no gamepad seen yet, type its id (see 'Gamepad id N' above) in the Pad id box");
+        debug_log("raw: no gamepad connected");
         return;
     }
 
@@ -347,7 +405,7 @@ static void _debug_win_send_preset(const BYTE *bytes, size_t length)
     int gamepad_id = _debug_win_pick_gamepad();
     if (gamepad_id < 0)
     {
-        debug_log("raw: no gamepad seen yet, type its id (see 'Gamepad id N' above) in the Pad id box");
+        debug_log("raw: no gamepad connected");
         return;
     }
     DWORD error = 0;
@@ -366,25 +424,49 @@ static BYTE _debug_win_sensitivity(void)
     return (BYTE)(value > 0xFF ? 0xFF : value);
 }
 
+static HWND _debug_win_make(HWND parent, LPCTSTR class_name, LPCTSTR text, DWORD style, DWORD ex_style, int id, HFONT font)
+{
+    HWND child = CreateWindowEx(ex_style, class_name, text, WS_CHILD | WS_VISIBLE | style, 0, 0, 0, 0, parent,
+                                (HMENU)(INT_PTR)id, GetModuleHandle(NULL), NULL);
+    if (child != NULL && font != NULL)
+    {
+        SendMessage(child, WM_SETFONT, (WPARAM)font, TRUE);
+    }
+    return child;
+}
+
 static LRESULT CALLBACK _debug_win_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
 {
     switch (msg)
     {
     case WM_CREATE:
     {
-        HINSTANCE inst = GetModuleHandle(NULL);
-        HGDIOBJ gui_font = GetStockObject(DEFAULT_GUI_FONT);
-        debug_hex_edit = CreateWindowEx(WS_EX_CLIENTEDGE, TEXT("EDIT"), TEXT("20 00 00"),
-                                        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-                                        0, 0, 0, 0, hwnd, (HMENU)IDC_HEX, inst, NULL);
-        SendMessage(debug_hex_edit, WM_SETFONT, (WPARAM)GetStockObject(ANSI_FIXED_FONT), TRUE);
-        debug_pad_label = CreateWindowEx(0, TEXT("STATIC"), TEXT("Pad id:"), WS_CHILD | WS_VISIBLE | SS_RIGHT,
-                                         0, 0, 0, 0, hwnd, NULL, inst, NULL);
-        SendMessage(debug_pad_label, WM_SETFONT, (WPARAM)gui_font, TRUE);
-        debug_id_edit = CreateWindowEx(WS_EX_CLIENTEDGE, TEXT("EDIT"), TEXT(""),
-                                       WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_AUTOHSCROLL,
-                                       0, 0, 0, 0, hwnd, (HMENU)IDC_PAD, inst, NULL);
-        SendMessage(debug_id_edit, WM_SETFONT, (WPARAM)gui_font, TRUE);
+        // Segoe UI (the system message font) for the controls, Consolas for the dumps and the log
+        NONCLIENTMETRICS metrics;
+        _mem_zero(&metrics, sizeof(metrics));
+        metrics.cbSize = sizeof(metrics);
+        if (SystemParametersInfo(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0))
+        {
+            debug_ui_font = CreateFontIndirect(&metrics.lfMessageFont);
+        }
+        debug_mono_font = CreateFont(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                                     CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, TEXT("Consolas"));
+        HFONT ui = debug_ui_font != NULL ? debug_ui_font : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        HFONT mono = debug_mono_font != NULL ? debug_mono_font : (HFONT)GetStockObject(ANSI_FIXED_FONT);
+
+        // row 1: which pad
+        debug_pad_label = _debug_win_make(hwnd, TEXT("STATIC"), TEXT("Pad"), SS_LEFT | SS_CENTERIMAGE, 0, 0, ui);
+        debug_pad_combo = _debug_win_make(hwnd, TEXT("COMBOBOX"), TEXT(""),
+                                          CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, IDC_PAD, ui);
+        debug_identify_button = _debug_win_make(hwnd, TEXT("BUTTON"), TEXT("Identify (vibrate)"),
+                                                BS_PUSHBUTTON | WS_TABSTOP, 0, IDC_IDENTIFY, ui);
+        debug_info_button = _debug_win_make(hwnd, TEXT("BUTTON"), TEXT("HID info"),
+                                            BS_PUSHBUTTON | WS_TABSTOP, 0, IDC_HID_INFO, ui);
+
+        // row 2: raw bytes
+        debug_hex_label = _debug_win_make(hwnd, TEXT("STATIC"), TEXT("Raw hex"), SS_LEFT | SS_CENTERIMAGE, 0, 0, ui);
+        debug_hex_edit = _debug_win_make(hwnd, TEXT("EDIT"), TEXT("20 00 00"), ES_AUTOHSCROLL | WS_TABSTOP,
+                                         WS_EX_CLIENTEDGE, IDC_HEX, mono);
         static const struct { int id; LPCTSTR text; } raw_buttons[3] =
         {
             { IDC_SEND_FEATURE, TEXT("Send feature") },
@@ -393,11 +475,11 @@ static LRESULT CALLBACK _debug_win_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
         };
         for (int i = 0; i < 3; i++)
         {
-            debug_raw_buttons[i] = CreateWindowEx(0, TEXT("BUTTON"), raw_buttons[i].text,
-                                                  WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                                  0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)raw_buttons[i].id, inst, NULL);
-            SendMessage(debug_raw_buttons[i], WM_SETFONT, (WPARAM)gui_font, TRUE);
+            debug_raw_buttons[i] = _debug_win_make(hwnd, TEXT("BUTTON"), raw_buttons[i].text,
+                                                   BS_PUSHBUTTON | WS_TABSTOP, 0, raw_buttons[i].id, ui);
         }
+
+        // row 3: presets
         static const struct { int id; LPCTSTR text; } preset_buttons[4] =
         {
             { IDC_INPUT_OFF, TEXT("Input off (0x23)") },
@@ -407,61 +489,117 @@ static LRESULT CALLBACK _debug_win_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
         };
         for (int i = 0; i < 4; i++)
         {
-            debug_preset_buttons[i] = CreateWindowEx(0, TEXT("BUTTON"), preset_buttons[i].text,
-                                                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                                     0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)preset_buttons[i].id, inst, NULL);
-            SendMessage(debug_preset_buttons[i], WM_SETFONT, (WPARAM)gui_font, TRUE);
+            debug_preset_buttons[i] = _debug_win_make(hwnd, TEXT("BUTTON"), preset_buttons[i].text,
+                                                      BS_PUSHBUTTON | WS_TABSTOP, 0, preset_buttons[i].id, ui);
         }
-        debug_info_button = CreateWindowEx(0, TEXT("BUTTON"), TEXT("HID info"), WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                                           0, 0, 0, 0, hwnd, (HMENU)IDC_HID_INFO, inst, NULL);
-        SendMessage(debug_info_button, WM_SETFONT, (WPARAM)gui_font, TRUE);
-        debug_sens_label = CreateWindowEx(0, TEXT("STATIC"), TEXT("Accel sens (hex):"), WS_CHILD | WS_VISIBLE | SS_RIGHT,
-                                          0, 0, 0, 0, hwnd, NULL, inst, NULL);
-        SendMessage(debug_sens_label, WM_SETFONT, (WPARAM)gui_font, TRUE);
-        debug_sens_edit = CreateWindowEx(WS_EX_CLIENTEDGE, TEXT("EDIT"), TEXT("08"),
-                                         WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-                                         0, 0, 0, 0, hwnd, (HMENU)IDC_SENS, inst, NULL);
-        SendMessage(debug_sens_edit, WM_SETFONT, (WPARAM)gui_font, TRUE);
-    }
-        debug_live_edit = CreateWindowEx(WS_EX_CLIENTEDGE, TEXT("EDIT"), TEXT(""),
-                                         WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY,
-                                         0, 0, 0, 0, hwnd, NULL, GetModuleHandle(NULL), NULL);
-        SendMessage(debug_live_edit, WM_SETFONT, (WPARAM)GetStockObject(ANSI_FIXED_FONT), TRUE);
-        debug_edit = CreateWindowEx(WS_EX_CLIENTEDGE, TEXT("EDIT"), TEXT(""),
-                                    WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
-                                    0, 0, 0, 0, hwnd, NULL, GetModuleHandle(NULL), NULL);
-        SendMessage(debug_edit, WM_SETFONT, (WPARAM)GetStockObject(ANSI_FIXED_FONT), TRUE);
+        debug_sens_label = _debug_win_make(hwnd, TEXT("STATIC"), TEXT("Accel sens (hex)"),
+                                           SS_RIGHT | SS_CENTERIMAGE, 0, 0, ui);
+        debug_sens_edit = _debug_win_make(hwnd, TEXT("EDIT"), TEXT("08"), ES_AUTOHSCROLL | WS_TABSTOP,
+                                          WS_EX_CLIENTEDGE, IDC_SENS, mono);
+
+        // output
+        debug_separator = _debug_win_make(hwnd, TEXT("STATIC"), TEXT(""), SS_ETCHEDHORZ, 0, 0, NULL);
+        debug_live_caption = _debug_win_make(hwnd, TEXT("STATIC"), TEXT("Live input"), SS_LEFT | SS_CENTERIMAGE, 0, 0, ui);
+        debug_live_edit = _debug_win_make(hwnd, TEXT("EDIT"), TEXT(""), ES_MULTILINE | ES_READONLY,
+                                          WS_EX_CLIENTEDGE, 0, mono);
+        debug_log_caption = _debug_win_make(hwnd, TEXT("STATIC"), TEXT("Log"), SS_LEFT | SS_CENTERIMAGE, 0, 0, ui);
+        debug_edit = _debug_win_make(hwnd, TEXT("EDIT"), TEXT(""),
+                                     WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, WS_EX_CLIENTEDGE, 0, mono);
         SendMessage(debug_edit, EM_SETLIMITTEXT, 0, 0);
+
+        // no pad yet: everything that needs one starts disabled (the refresh enables it)
+        EnableWindow(debug_pad_combo, FALSE);
+        EnableWindow(debug_identify_button, FALSE);
+        EnableWindow(debug_info_button, FALSE);
+        for (int i = 0; i < 3; i++)
+        {
+            EnableWindow(debug_raw_buttons[i], FALSE);
+        }
+        for (int i = 0; i < 4; i++)
+        {
+            EnableWindow(debug_preset_buttons[i], FALSE);
+        }
+        _debug_win_refresh_pads();
         SetTimer(hwnd, DEBUG_WIN_TIMER_ID, DEBUG_WIN_TIMER_MS, NULL);
         return 0;
+    }
+
+    case WM_GETMINMAXINFO:
+    {
+        MINMAXINFO *info = (MINMAXINFO *)lparam;
+        info->ptMinTrackSize.x = DBG_MIN_WIDTH;
+        info->ptMinTrackSize.y = DBG_MIN_HEIGHT;
+        return 0;
+    }
+
+    case WM_CTLCOLORSTATIC:
+        // read-only edits are painted like static text (grey): keep the output areas white
+        if ((HWND)lparam == debug_live_edit || (HWND)lparam == debug_edit)
+        {
+            SetTextColor((HDC)wparam, GetSysColor(COLOR_WINDOWTEXT));
+            SetBkColor((HDC)wparam, GetSysColor(COLOR_WINDOW));
+            return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
+        }
+        break;
 
     case WM_SIZE:
     {
         int width = LOWORD(lparam);
         int height = HIWORD(lparam);
-        int toolbar = height < DEBUG_WIN_TOOLBAR_HEIGHT ? height : DEBUG_WIN_TOOLBAR_HEIGHT;
-        int rest = height - toolbar;
-        int live_height = rest < DEBUG_WIN_LIVE_HEIGHT ? rest : DEBUG_WIN_LIVE_HEIGHT;
+        int inner = width - 2 * DBG_MARGIN;
+        if (inner < 0)
+        {
+            inner = 0;
+        }
+        int row1 = DBG_MARGIN;
+        int row2 = row1 + DBG_ROW + DBG_GAP;
+        int row3 = row2 + DBG_ROW + DBG_GAP;
+        int top = row3 + DBG_ROW + DBG_MARGIN + 4;
 
-        int buttons_x = width - 3 * DEBUG_WIN_BUTTON_WIDTH;
+        // row 1: Pad [dropdown] [Identify] [HID info]
+        int x = DBG_MARGIN;
+        MoveWindow(debug_pad_label, x, row1, DBG_LABEL_WIDTH, DBG_ROW, TRUE);
+        x += DBG_LABEL_WIDTH;
+        MoveWindow(debug_pad_combo, x, row1, 190, 220, TRUE);
+        x += 190 + DBG_GAP;
+        MoveWindow(debug_identify_button, x, row1, 140, DBG_ROW, TRUE);
+        x += 140 + 4;
+        MoveWindow(debug_info_button, x, row1, 90, DBG_ROW, TRUE);
+
+        // row 2: Raw hex [edit] [3 buttons]
+        int buttons_x = width - DBG_MARGIN - 3 * DBG_RAW_BUTTON_WIDTH - 2 * 4;
+        int hex_x = DBG_MARGIN + DBG_LABEL_WIDTH;
+        int hex_width = buttons_x - DBG_GAP - hex_x;
+        MoveWindow(debug_hex_label, DBG_MARGIN, row2, DBG_LABEL_WIDTH, DBG_ROW, TRUE);
+        MoveWindow(debug_hex_edit, hex_x, row2, hex_width > 40 ? hex_width : 40, DBG_ROW, TRUE);
         for (int i = 0; i < 3; i++)
         {
-            MoveWindow(debug_raw_buttons[i], buttons_x + i * DEBUG_WIN_BUTTON_WIDTH, 2, DEBUG_WIN_BUTTON_WIDTH, DEBUG_WIN_ROW_HEIGHT - 4, TRUE);
+            MoveWindow(debug_raw_buttons[i], buttons_x + i * (DBG_RAW_BUTTON_WIDTH + 4), row2, DBG_RAW_BUTTON_WIDTH, DBG_ROW, TRUE);
         }
-        MoveWindow(debug_id_edit, buttons_x - 44, 3, 40, DEBUG_WIN_ROW_HEIGHT - 6, TRUE);
-        MoveWindow(debug_pad_label, buttons_x - 98, 8, 50, 18, TRUE);
-        MoveWindow(debug_hex_edit, 0, 3, buttons_x > 150 ? buttons_x - 102 : 48, DEBUG_WIN_ROW_HEIGHT - 6, TRUE);
 
+        // row 3: presets and the accel sensitivity
         for (int i = 0; i < 4; i++)
         {
-            MoveWindow(debug_preset_buttons[i], i * DEBUG_WIN_BUTTON_WIDTH, DEBUG_WIN_ROW_HEIGHT + 2, DEBUG_WIN_BUTTON_WIDTH, DEBUG_WIN_ROW_HEIGHT - 4, TRUE);
+            MoveWindow(debug_preset_buttons[i], DBG_MARGIN + i * (DBG_PRESET_BUTTON_WIDTH + 4), row3, DBG_PRESET_BUTTON_WIDTH, DBG_ROW, TRUE);
         }
-        MoveWindow(debug_info_button, 4 * DEBUG_WIN_BUTTON_WIDTH, DEBUG_WIN_ROW_HEIGHT + 2, DEBUG_WIN_BUTTON_WIDTH, DEBUG_WIN_ROW_HEIGHT - 4, TRUE);
-        MoveWindow(debug_sens_label, 5 * DEBUG_WIN_BUTTON_WIDTH + 6, DEBUG_WIN_ROW_HEIGHT + 8, 100, 18, TRUE);
-        MoveWindow(debug_sens_edit, 5 * DEBUG_WIN_BUTTON_WIDTH + 110, DEBUG_WIN_ROW_HEIGHT + 3, 40, DEBUG_WIN_ROW_HEIGHT - 6, TRUE);
+        int sens_x = DBG_MARGIN + 4 * (DBG_PRESET_BUTTON_WIDTH + 4) + 8;
+        MoveWindow(debug_sens_label, sens_x, row3, 110, DBG_ROW, TRUE);
+        MoveWindow(debug_sens_edit, sens_x + 116, row3, 40, DBG_ROW, TRUE);
 
-        MoveWindow(debug_live_edit, 0, toolbar, width, live_height, TRUE);
-        MoveWindow(debug_edit, 0, toolbar + live_height, width, rest - live_height, TRUE);
+        // output: live decode on top, log below
+        int available = height - top - 2 * DBG_CAPTION - DBG_GAP - DBG_MARGIN;
+        if (available < 0)
+        {
+            available = 0;
+        }
+        int live_height = available / 2 < DEBUG_WIN_LIVE_HEIGHT ? available / 2 : DEBUG_WIN_LIVE_HEIGHT;
+        int log_y = top + DBG_CAPTION + live_height + DBG_GAP;
+        int log_height = height - log_y - DBG_CAPTION - DBG_MARGIN;
+        MoveWindow(debug_separator, DBG_MARGIN, top - 4, inner, 2, TRUE);
+        MoveWindow(debug_live_caption, DBG_MARGIN, top, inner, DBG_CAPTION, TRUE);
+        MoveWindow(debug_live_edit, DBG_MARGIN, top + DBG_CAPTION, inner, live_height, TRUE);
+        MoveWindow(debug_log_caption, DBG_MARGIN, log_y, inner, DBG_CAPTION, TRUE);
+        MoveWindow(debug_edit, DBG_MARGIN, log_y + DBG_CAPTION, inner, log_height > 0 ? log_height : 0, TRUE);
         return 0;
     }
 
@@ -470,6 +608,23 @@ static LRESULT CALLBACK _debug_win_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
         {
             switch (LOWORD(wparam))
             {
+            case IDCANCEL:
+                // Esc (from the dialog-style keyboard handling) hides the window like the close button
+                ShowWindow(hwnd, SW_HIDE);
+                break;
+            case IDC_IDENTIFY:
+            {
+                int gamepad_id = _debug_win_pick_gamepad();
+                if (gamepad_id < 0)
+                {
+                    debug_log("identify: no gamepad connected");
+                }
+                else
+                {
+                    mi_gamepad_identify(gamepad_id);
+                }
+                break;
+            }
             case IDC_SEND_FEATURE:
                 _debug_win_do_raw(MI_RAW_SEND_FEATURE);
                 break;
@@ -506,7 +661,7 @@ static LRESULT CALLBACK _debug_win_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
                 int gamepad_id = _debug_win_pick_gamepad();
                 if (gamepad_id < 0)
                 {
-                    debug_log("describe: no gamepad seen yet, type its id (see 'Gamepad id N' above) in the Pad id box");
+                    debug_log("describe: no gamepad connected");
                 }
                 else if (!mi_gamepad_describe(gamepad_id))
                 {
@@ -527,6 +682,7 @@ static LRESULT CALLBACK _debug_win_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
     case WM_TIMER:
         if (wparam == DEBUG_WIN_TIMER_ID && IsWindowVisible(hwnd))
         {
+            _debug_win_refresh_pads();
             _debug_win_refresh_live();
         }
         return 0;
@@ -543,6 +699,7 @@ static LRESULT CALLBACK _debug_win_proc(HWND hwnd, UINT msg, WPARAM wparam, LPAR
         }
         else
         {
+            _debug_win_refresh_pads();
             ShowWindow(hwnd, SW_SHOW);
             SetForegroundWindow(hwnd);
         }
@@ -575,12 +732,12 @@ static DWORD WINAPI _debug_win_thread_proc(LPVOID param)
     wc.lpfnWndProc = _debug_win_proc;
     wc.hInstance = GetModuleHandle(NULL);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     wc.lpszClassName = DEBUG_WIN_CLASS;
     RegisterClassEx(&wc);
 
     debug_hwnd = CreateWindowEx(0, DEBUG_WIN_CLASS, DEBUG_WIN_TITLE, WS_OVERLAPPEDWINDOW,
-                                CW_USEDEFAULT, CW_USEDEFAULT, 700, 720, NULL, NULL, wc.hInstance, NULL);
+                                CW_USEDEFAULT, CW_USEDEFAULT, 760, 800, NULL, NULL, wc.hInstance, NULL);
     SetEvent(debug_ready_event);
     if (debug_hwnd == NULL)
     {
@@ -590,13 +747,28 @@ static DWORD WINAPI _debug_win_thread_proc(LPVOID param)
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0) > 0)
     {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
+        // Tab / Shift+Tab / Esc work between the controls
+        if (!IsDialogMessage(debug_hwnd, &msg))
+        {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
     }
 
     debug_hwnd = NULL;
     debug_edit = NULL;
     debug_live_edit = NULL;
+    debug_pad_combo = NULL;
+    if (debug_ui_font != NULL)
+    {
+        DeleteObject(debug_ui_font);
+        debug_ui_font = NULL;
+    }
+    if (debug_mono_font != NULL)
+    {
+        DeleteObject(debug_mono_font);
+        debug_mono_font = NULL;
+    }
     UnregisterClass(DEBUG_WIN_CLASS, wc.hInstance);
     return 0;
 }

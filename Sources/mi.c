@@ -573,6 +573,18 @@ BOOLEAN mi_gamepad_describe(int gamepad_id)
     return found;
 }
 
+int mi_gamepad_list(int *ids, int max)
+{
+    int count = 0;
+    AcquireSRWLockShared(&gp_lock);
+    for (struct mi_gamepad *cur_gp = root_gp; cur_gp != NULL && count < max; cur_gp = cur_gp->next)
+    {
+        ids[count++] = cur_gp->id;
+    }
+    ReleaseSRWLockShared(&gp_lock);
+    return count;
+}
+
 void mi_gamepad_stop(int gamepad_id)
 {
     AcquireSRWLockShared(&gp_lock);

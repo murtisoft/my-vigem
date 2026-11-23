@@ -75,6 +75,9 @@ void mi_gamepad_identify(int gamepad_id);
 // Debug: log the HID descriptor summary of a live gamepad. Returns FALSE if the gamepad does not exist.
 BOOLEAN mi_gamepad_describe(int gamepad_id);
 
+// Debug: copies the ids of the live gamepads (oldest first) into ids, at most max of them. Returns the count.
+int mi_gamepad_list(int *ids, int max);
+
 INT mi_gamepad_raw(int gamepad_id, BYTE kind, const BYTE *in, size_t in_len, BYTE *out, size_t out_size, DWORD *error);
 
 #endif /* MI_H */
